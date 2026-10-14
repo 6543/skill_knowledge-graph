@@ -38,7 +38,9 @@ def test_a_large_file_does_not_outrank_the_file_that_answers_the_question(
         for i in range(60)
     ]
     nodes.append(
-        chunk("repo", "runbooks/mailer.md", 1, "The mailer timeout is raised in app.ini.")
+        chunk(
+            "repo", "runbooks/mailer.md", 1, "The mailer timeout is raised in app.ini."
+        )
     )
     kg = graph(tmp_path, monkeypatch, nodes)
 
@@ -47,7 +49,10 @@ def test_a_large_file_does_not_outrank_the_file_that_answers_the_question(
 
 
 def test_a_rare_term_outweighs_a_term_that_appears_everywhere(tmp_path, monkeypatch):
-    nodes = [chunk("repo", f"common/file{i}.md", 1, "gitea configuration notes") for i in range(40)]
+    nodes = [
+        chunk("repo", f"common/file{i}.md", 1, "gitea configuration notes")
+        for i in range(40)
+    ]
     nodes.append(chunk("repo", "db/pool.md", 1, "gitea sets MAX_OPEN_CONNS to 60"))
     kg = graph(tmp_path, monkeypatch, nodes)
 
@@ -55,9 +60,16 @@ def test_a_rare_term_outweighs_a_term_that_appears_everywhere(tmp_path, monkeypa
     assert results[0]["path"] == "db/pool.md"
 
 
-def test_a_match_in_the_path_locates_a_module_the_body_never_names(tmp_path, monkeypatch):
+def test_a_match_in_the_path_locates_a_module_the_body_never_names(
+    tmp_path, monkeypatch
+):
     nodes = [
-        chunk("repo", "modules/markup/render.go", 1, "func New() *Renderer { return &Renderer{} }"),
+        chunk(
+            "repo",
+            "modules/markup/render.go",
+            1,
+            "func New() *Renderer { return &Renderer{} }",
+        ),
         chunk("repo", "docs/intro.md", 1, "Gitea turns text into pages while it runs."),
     ]
     kg = graph(tmp_path, monkeypatch, nodes)
@@ -68,7 +80,9 @@ def test_a_match_in_the_path_locates_a_module_the_body_never_names(tmp_path, mon
 
 def test_a_prefix_match_in_the_path_survives_a_word_ending(tmp_path, monkeypatch):
     nodes = [
-        chunk("repo", "services/repository/archiver/archiver.go", 1, "func doArchive() {}"),
+        chunk(
+            "repo", "services/repository/archiver/archiver.go", 1, "func doArchive() {}"
+        ),
         chunk("repo", "docs/other.md", 1, "unrelated prose"),
     ]
     kg = graph(tmp_path, monkeypatch, nodes)
@@ -80,7 +94,9 @@ def test_a_prefix_match_in_the_path_survives_a_word_ending(tmp_path, monkeypatch
 def test_absent_terms_are_reported_so_absence_can_be_distinguished_from_bad_ranking(
     tmp_path, monkeypatch
 ):
-    kg = graph(tmp_path, monkeypatch, [chunk("repo", "notes.md", 1, "postgres pool sizing")])
+    kg = graph(
+        tmp_path, monkeypatch, [chunk("repo", "notes.md", 1, "postgres pool sizing")]
+    )
 
     answer = kg.search(["postgres", "Cassandra"])
     assert answer["unmatched"] == ["Cassandra"]
@@ -107,3 +123,40 @@ def test_question_words_are_dropped_but_identifiers_survive_tokenisation():
         "set",
         "app.ini",
     ]
+
+
+def test_merging_one_chunk_leaves_the_existing_index_intact(tmp_path, monkeypatch):
+    kg = graph(tmp_path, monkeypatch, [chunk("repo", "old.md", 1, "perfectoid spaces")])
+
+    kg.load([chunk("repo", "new.md", 1, "condensed mathematics")], [], replace=False)
+
+    assert kg.search_keywords(["perfectoid"])[0]["path"] == "old.md"
+    assert kg.search_keywords(["condensed"])[0]["path"] == "new.md"
+
+
+def test_rewriting_a_chunk_removes_the_text_it_used_to_hold(tmp_path, monkeypatch):
+    kg = graph(tmp_path, monkeypatch, [chunk("repo", "notes.md", 1, "the old wording")])
+
+    kg.load(
+        [chunk("repo", "notes.md", 1, "the new wording")],
+        [],
+        replace=False,
+        on_conflict="incoming",
+    )
+
+    assert kg.search_keywords(["old wording"]) == []
+    assert kg.search_keywords(["new wording"])[0]["path"] == "notes.md"
+
+
+def test_document_frequency_counts_every_chunk_not_just_the_fetched_ones(
+    tmp_path, monkeypatch
+):
+    """Inferring frequency from the capped result set understates how common a word
+    is, which inflates its weight exactly where the corpus is large enough to care."""
+    nodes = [chunk("repo", f"f{i}.md", 1, "common word here") for i in range(30)]
+    nodes.append(chunk("repo", "rare.md", 1, "singular word here"))
+    kg = graph(tmp_path, monkeypatch, nodes)
+
+    assert kg.document_frequency("common") == 30
+    assert kg.document_frequency("singular") == 1
+    assert kg.document_frequency("absent") == 0

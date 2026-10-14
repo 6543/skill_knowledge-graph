@@ -42,6 +42,27 @@ def probe(item: dict, graph: KG, k: int) -> dict:
     mode = item.get("mode", "text")
     started = time.perf_counter()
     try:
+        if k <= 0:
+            raise ValueError("k must be positive")
+        expected = {key for key in item if key.startswith("expect_")}
+        allowed = {
+            "text": {"expect_paths", "expect_sources", "expect_empty"},
+            "keyword": {"expect_paths", "expect_sources", "expect_empty"},
+            "sparql": {
+                "expect_first",
+                "expect_min_first",
+                "expect_min_rows",
+                "expect_rows_contain",
+                "expect_empty",
+            },
+            "neighbors": {"expect_min_rows", "expect_rows_contain", "expect_empty"},
+        }.get(mode, set())
+        if expected - allowed:
+            raise ValueError(
+                f"unsupported expectations for {mode}: {sorted(expected - allowed)}"
+            )
+        if not expected - {"expect_sources"}:
+            raise ValueError("probe needs an explicit expected result")
         if mode == "text":
             rows = graph.search(
                 tokenize(item["question"]), limit=k, source=item.get("source")
@@ -60,12 +81,17 @@ def probe(item: dict, graph: KG, k: int) -> dict:
             rows = graph.neighbors(item["label"], item["node_id"])
         else:
             raise ValueError(f"unknown mode {mode!r}")
-    except Exception as exc:  # a broken probe is a result, not a crash
-        return {"hit": False, "rank": None, "ms": (time.perf_counter() - started) * 1000,
-                "error": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:  # noqa: BLE001 - a broken probe is recorded as a failed result
+        return {
+            "hit": False,
+            "rank": None,
+            "ms": (time.perf_counter() - started) * 1000,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     elapsed = (time.perf_counter() - started) * 1000
 
     if mode == "sparql":
+        rows = [rows] if isinstance(rows, bool) else rows
         first = rows[0] if rows else None
         if isinstance(first, list):
             first = first[0]
@@ -73,36 +99,73 @@ def probe(item: dict, graph: KG, k: int) -> dict:
         if "expect_first" in item:
             ok = ok and first == item["expect_first"]
         if "expect_min_first" in item:
-            ok = ok and isinstance(first, (int, float)) and first >= item["expect_min_first"]
+            ok = (
+                ok
+                and isinstance(first, (int, float))
+                and first >= item["expect_min_first"]
+            )
         if "expect_min_rows" in item:
             ok = ok and len(rows) >= item["expect_min_rows"]
         if "expect_rows_contain" in item:
-            flat = " ".join(str(row) for row in rows)
+            flat = [
+                value
+                for row in rows
+                for value in (row if isinstance(row, list) else [row])
+            ]
             ok = ok and all(value in flat for value in item["expect_rows_contain"])
-        return {"hit": bool(ok), "rank": 1 if ok else None, "ms": elapsed,
-                "detail": {"rows": len(rows), "first": first}}
+        if "expect_empty" in item:
+            ok = ok and (not rows) == item["expect_empty"]
+        return {
+            "hit": bool(ok),
+            "rank": 1 if ok else None,
+            "ms": elapsed,
+            "detail": {"rows": len(rows), "first": first},
+        }
 
     if mode == "neighbors":
         ok = len(rows) >= item.get("expect_min_rows", 1)
-        return {"hit": ok, "rank": 1 if ok else None, "ms": elapsed, "detail": {"rows": len(rows)}}
+        if "expect_empty" in item:
+            ok = (not rows) == item["expect_empty"]
+        if "expect_rows_contain" in item:
+            ok = ok and all(
+                value in [row["id"] for row in rows]
+                for value in item["expect_rows_contain"]
+            )
+        return {
+            "hit": ok,
+            "rank": 1 if ok else None,
+            "ms": elapsed,
+            "detail": {"rows": len(rows)},
+        }
 
     paths = [row.get("path", "") for row in rows]
-    if item.get("expect_empty"):
-        ok = not rows
-        return {"hit": ok, "rank": 1 if ok else None, "ms": elapsed,
-                "detail": {"rows": len(rows), "top": paths[:3]}}
+    if "expect_empty" in item and not item.get("expect_paths"):
+        ok = (not rows) == item["expect_empty"]
+        return {
+            "hit": ok,
+            "rank": 1 if ok else None,
+            "ms": elapsed,
+            "detail": {"rows": len(rows), "top": paths[:3]},
+        }
 
     rank = None
     for index, path in enumerate(paths[:k], 1):
-        if any(pattern in path for pattern in item.get("expect_paths", [])):
+        if any(pattern in path for pattern in item.get("expect_paths", [])) and (
+            not item.get("expect_sources")
+            or rows[index - 1].get("repository") in item["expect_sources"]
+        ):
             rank = index
             break
     if rank and item.get("require_lines"):
         evidence = rows[rank - 1].get("evidence", [])
         if not any(hit.get("start_line") is not None for hit in evidence):
             rank = None
-    return {"hit": rank is not None, "rank": rank, "ms": elapsed,
-            "detail": {"rows": len(rows), "top": paths[:3]}}
+    return {
+        "hit": rank is not None,
+        "rank": rank,
+        "ms": elapsed,
+        "detail": {"rows": len(rows), "top": paths[:3]},
+    }
 
 
 def main():
@@ -143,22 +206,30 @@ def main():
         "k": args.k,
         "questions": len(results),
         "hits": sum(1 for outcome in results if outcome["hit"]),
-        "accuracy": round(sum(1 for o in results if o["hit"]) / max(len(results), 1), 4),
+        "accuracy": round(
+            sum(1 for o in results if o["hit"]) / max(len(results), 1), 4
+        ),
         "mrr": round(
-            statistics.mean(1 / o["rank"] if o["rank"] else 0.0 for o in results) if results else 0,
+            statistics.mean(1 / o["rank"] if o["rank"] else 0.0 for o in results)
+            if results
+            else 0,
             4,
         ),
         "errors": sum(1 for outcome in results if outcome.get("error")),
         "open_ms": round(open_ms, 2),
         "median_ms": round(statistics.median(latencies), 2) if latencies else 0,
-        "p95_ms": round(latencies[max(int(len(latencies) * 0.95) - 1, 0)], 2) if latencies else 0,
+        "p95_ms": round(latencies[max(int(len(latencies) * 0.95) - 1, 0)], 2)
+        if latencies
+        else 0,
         "by_category": {
             name: {"hits": hits, "n": total, "accuracy": round(hits / total, 3)}
             for name, (hits, total) in sorted(by_category.items())
         },
         "stats": graph.stats(),
     }
+    graph.close()
     if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(
             json.dumps({"summary": summary, "results": results}, indent=2, default=str),
             encoding="utf-8",

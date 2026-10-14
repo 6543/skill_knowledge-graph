@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from store import KG, GraphValidationError, read_records, validate_graph, write_records
+from store import (
+    KG,
+    MAX_PACKAGE_BYTES,
+    MIN_SCORE,
+    GraphValidationError,
+    read_records,
+    tokenize,
+    validate_graph,
+    write_records,
+)
 
 
 def output(value):
@@ -30,12 +39,20 @@ def build_parser():
         item.add_argument("graph")
         return item
 
-    load = command("load", help="load neutral records; replaces the graph by default")
+    load = command("load", help="merge neutral records into the graph by default")
     load.add_argument("--nodes", type=Path, required=True)
-    load.add_argument("--edges", type=Path, required=True)
+    load.add_argument(
+        "--edges", type=Path, help="optional; omit for a node-only delta batch"
+    )
     mode = load.add_mutually_exclusive_group()
-    mode.add_argument("--merge", action="store_true", help="add to what is already there")
+    mode.add_argument(
+        "--merge", action="store_true", help="add to what is already there"
+    )
+    mode.add_argument(
+        "--replace", action="store_true", help="explicitly replace the whole graph"
+    )
     mode.add_argument("--source", help="replace only this source, keeping the others")
+    load.add_argument("--on-conflict", choices=("error", "incoming"), default="error")
 
     validate = commands.add_parser("validate", help="check records before loading")
     validate.add_argument("--nodes", type=Path, required=True)
@@ -43,15 +60,21 @@ def build_parser():
 
     export = command("export", help="write a portable .graph-skill-db archive")
     export.add_argument("--out", type=Path, required=True)
+    export.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
 
     importer = command("import", help="merge a .graph-skill-db archive into a graph")
     importer.add_argument("--file", type=Path, required=True)
+    importer.add_argument(
+        "--on-conflict", choices=("error", "incoming"), default="error"
+    )
+    importer.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
     importer.add_argument(
         "--replace", action="store_true", help="discard the current graph first"
     )
 
     inspect = commands.add_parser("inspect", help="read an archive without loading it")
     inspect.add_argument("--file", type=Path, required=True)
+    inspect.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
 
     dump = command("dump", help="write the graph back out as neutral records")
     dump.add_argument("--nodes", type=Path, required=True)
@@ -94,6 +117,13 @@ def build_parser():
     search.add_argument("--any", action="store_true", help="match any phrase, not all")
     search.add_argument("--source", help="restrict results to one source")
     search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--candidate-limit", type=int, default=20000)
+    search.add_argument(
+        "--min-score",
+        type=float,
+        default=MIN_SCORE,
+        help="drop results accounting for less than this share of the query",
+    )
 
     query = command("query")
     group = query.add_mutually_exclusive_group(required=True)
@@ -107,28 +137,45 @@ def main():
 
     if args.command == "validate":
         return output(
-            validate_graph(list(read_records(args.nodes)), list(read_records(args.edges)))
+            validate_graph(
+                list(read_records(args.nodes)), list(read_records(args.edges))
+            )
         )
     if args.command == "inspect":
-        manifest, nodes, edges = KG.read_package(args.file)
+        manifest, nodes, edges = KG.read_package(args.file, max_bytes=args.max_bytes)
         return output({**manifest, "read_nodes": len(nodes), "read_edges": len(edges)})
 
     creating = args.command in {"load", "import"}
     graph = KG(args.graph, create=creating)
+    try:
+        return run(args, graph)
+    finally:
+        graph.close()
+
+
+def run(args, graph):
 
     if args.command == "load":
         return output(
             graph.load(
                 read_records(args.nodes),
-                read_records(args.edges),
-                replace=not args.merge,
+                read_records(args.edges) if args.edges else (),
+                replace=args.replace,
                 source=args.source,
+                on_conflict=args.on_conflict,
             )
         )
     if args.command == "import":
-        return output(graph.import_package(args.file, replace=args.replace))
+        return output(
+            graph.import_package(
+                args.file,
+                replace=args.replace,
+                on_conflict=args.on_conflict,
+                max_bytes=args.max_bytes,
+            )
+        )
     if args.command == "export":
-        return output(graph.export_package(args.out))
+        return output(graph.export_package(args.out, max_bytes=args.max_bytes))
     if args.command == "dump":
         nodes, edges = graph.export_records()
         return output(
@@ -153,10 +200,14 @@ def main():
         )
     if args.command == "neighbors":
         return output(
-            graph.neighbors(args.label, args.id, comma_list(args.rels), inbound=args.inbound)
+            graph.neighbors(
+                args.label, args.id, comma_list(args.rels), inbound=args.inbound
+            )
         )
     if args.command == "reach":
-        return output(graph.reach(args.label, args.id, comma_list(args.rels), args.node_label))
+        return output(
+            graph.reach(args.label, args.id, comma_list(args.rels), args.node_label)
+        )
     if args.command == "path":
         return output(
             graph.path(
@@ -169,21 +220,15 @@ def main():
             )
         )
     if args.command == "search":
-        if args.text:
-            from store import tokenize
-
-            return output(
-                graph.search(
-                    tokenize(args.text), limit=args.limit, scope=args.scope, source=args.source
-                )
-            )
         return output(
             graph.search(
-                args.keyword,
+                tokenize(args.text) if args.text else args.keyword,
                 limit=args.limit,
                 scope=args.scope,
-                require_all=not args.any,
+                require_all=bool(args.keyword) and not args.any,
+                min_score=args.min_score,
                 source=args.source,
+                candidate_limit=args.candidate_limit,
             )
         )
     if args.command == "query":
@@ -194,6 +239,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (GraphValidationError, FileNotFoundError) as exc:
+    except (GraphValidationError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)

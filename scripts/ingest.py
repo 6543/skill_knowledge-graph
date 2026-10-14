@@ -8,6 +8,7 @@ import codecs
 import hashlib
 import json
 import mimetypes
+import os
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -64,11 +65,25 @@ SKIP_DIRECTORIES = {
     ".git",
     ".hg",
     ".kg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     ".svn",
-    ".venv",
+    ".tox",
     "__pycache__",
     "node_modules",
+    "site-packages",
+    "target",
+    "vendor",
 }
+# Virtualenvs are named freely, and an exact-match skip list misses every variant.
+# Ingesting one pulls thousands of vendored files into the graph and buries the
+# corpus the questions are actually about.
+SKIP_PREFIXES = (".venv", "venv", ".direnv", ".cache")
+
+
+def skipped_directory(name: str) -> bool:
+    return name in SKIP_DIRECTORIES or name.startswith(SKIP_PREFIXES)
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$")
 ENVIRONMENT_VARIABLE = re.compile(r"\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b")
 URL = re.compile(r"https?://[^\s<>'\")\]]+")
@@ -118,6 +133,14 @@ def sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def stream_sha256(path: Path, block: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def url_host(url: str) -> str:
     """Corpora contain deliberately malformed URLs; a bad one must not abort an ingest."""
     try:
@@ -127,6 +150,8 @@ def url_host(url: str) -> str:
 
 
 def chunk_text(text: str, suffix: str, max_chars: int = 6000) -> list[Chunk]:
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
     lines = text.splitlines()
     chunks = []
     buffer = []
@@ -211,18 +236,43 @@ class Builder:
 
 def discover(inputs: list[Path]):
     multiple = len(inputs) > 1
+    seen = set()
     for root in sorted(path.resolve() for path in inputs):
+        if not root.exists():
+            raise FileNotFoundError(root)
         if root.is_file():
+            if root.name in seen:
+                raise ValueError(f"duplicate input name: {root.name}")
+            seen.add(root.name)
             yield root, root.name
             continue
         prefix = root.name + "/" if multiple else ""
-        for path in sorted(item for item in root.rglob("*") if item.is_file()):
-            if any(part in SKIP_DIRECTORIES for part in path.relative_to(root).parts):
-                continue
-            yield path, prefix + path.relative_to(root).as_posix()
+        for directory, directories, filenames in os.walk(root, followlinks=False):
+            directories[:] = sorted(
+                d
+                for d in directories
+                if not skipped_directory(d) and not (Path(directory) / d).is_symlink()
+            )
+            for filename in sorted(filenames):
+                path = Path(directory) / filename
+                if path.is_symlink() or not path.is_file():
+                    continue
+                relative = prefix + path.relative_to(root).as_posix()
+                if relative in seen:
+                    raise ValueError(f"duplicate input path: {relative}")
+                seen.add(relative)
+                yield path, relative
 
 
 def is_text(path: Path, raw: bytes) -> bool:
+    media_type = mimetypes.guess_type(path.name)[0] or ""
+    if (
+        media_type.startswith(("image/", "audio/", "video/"))
+        or path.suffix.lower()
+        in {".pdf", ".ps", ".eps", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+        or raw.startswith((b"%PDF-", b"PK\x03\x04", b"\x1f\x8b"))
+    ):
+        return False
     if b"\0" in raw[:8192]:
         return False
     if path.suffix.lower() in TEXT_EXTENSIONS or path.name in TEXT_NAMES:
@@ -245,15 +295,37 @@ def build_graph(
     mentions: bool = True,
     links: bool = True,
 ):
+    if not inputs or not source_name or max_chars <= 0 or max_file_bytes <= 0:
+        raise ValueError("inputs, source name and positive size limits are required")
     builder = Builder()
-    roots = [str(path.resolve()) for path in sorted(inputs)]
+    # Roots stay as given rather than resolved: an absolute path bakes one machine's
+    # layout into the records, so the same corpus would export differently on every
+    # machine and two people's packages could never be compared.
+    roots = sorted(path.resolve().name for path in inputs)
     builder.node("Source", source_name, name=source_name, roots=roots)
     for path, relative in discover(inputs):
+        size = path.stat().st_size
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        digest = stream_sha256(path)
+        node_id = f"{source_name}:{relative}@{digest}"
+        if size > max_file_bytes:
+            # Never read an oversized file into memory just to decide to skip it.
+            builder.node(
+                "Artifact",
+                node_id,
+                name=path.name,
+                path=relative,
+                source=source_name,
+                media_type=media_type,
+                size_bytes=size,
+                sha256=digest,
+                reason="exceeds max_file_bytes",
+            )
+            builder.edge("CONTAINS", "Source", source_name, "Artifact", node_id)
+            continue
         raw = path.read_bytes()
         digest = sha256(raw)
-        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        node_id = f"{source_name}:{relative}"
-        if len(raw) > max_file_bytes or not is_text(path, raw):
+        if not is_text(path, raw):
             builder.node(
                 "Artifact",
                 node_id,
@@ -268,9 +340,11 @@ def build_graph(
             continue
 
         text = raw.decode("utf-8", errors="replace")
-        if path.suffix.lower() in {".htm", ".html"} or re.match(
-            r"\s*(?:<!doctype\s+html|<html\b)", text, re.IGNORECASE
-        ):
+        decoding = "utf-8-replacement" if "\ufffd" in text else "utf-8"
+        extracted_html = path.suffix.lower() in {".htm", ".html"} or bool(
+            re.match(r"\s*(?:<!doctype\s+html|<html\b)", text, re.IGNORECASE)
+        )
+        if extracted_html:
             text = html_text(text)
         builder.node(
             "Document",
@@ -282,6 +356,8 @@ def build_graph(
             media_type=media_type,
             size_bytes=len(raw),
             sha256=digest,
+            extractor="html-text@2" if extracted_html else "plain-text@2",
+            decoding=decoding,
         )
         builder.edge("CONTAINS", "Source", source_name, "Document", node_id)
         for index, chunk in enumerate(chunk_text(text, path.suffix, max_chars)):
@@ -291,6 +367,12 @@ def build_graph(
                 "Chunk",
                 chunk_id,
                 document_id=node_id,
+                document_sha256=digest,
+                extractor="html-text@2" if extracted_html else "plain-text@2",
+                locator_basis="derived_text_lines"
+                if extracted_html
+                else "source_lines",
+                decoding=decoding,
                 heading=chunk.heading,
                 path=relative,
                 source=source_name,
@@ -305,7 +387,11 @@ def build_graph(
                 for variable in sorted(set(ENVIRONMENT_VARIABLE.findall(chunk.text))):
                     builder.node("EnvironmentVariable", variable, name=variable)
                     builder.edge(
-                        "MENTIONS_ENV", "Chunk", chunk_id, "EnvironmentVariable", variable
+                        "MENTIONS_ENV",
+                        "Chunk",
+                        chunk_id,
+                        "EnvironmentVariable",
+                        variable,
                     )
             if links:
                 for url in sorted(set(URL.findall(chunk.text))):

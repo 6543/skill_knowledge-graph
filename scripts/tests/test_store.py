@@ -85,7 +85,7 @@ def test_load_replaces_stale_facts_and_keeps_chunk_text_out_of_rdf(
         "source": "fixture",
     }
 
-    graph.load([nodes[0]], [])
+    graph.load([nodes[0]], [], replace=True)
     assert graph.stats()["nodes"] == 1
     assert graph.search_keywords(["GetUser"], scope="file") == []
 
