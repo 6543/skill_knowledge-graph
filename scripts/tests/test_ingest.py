@@ -3,15 +3,40 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from ingest import build_graph, chunk_text
+from ingest import Chunk, build_graph, chunk_text
 
 
 def test_markdown_chunks_keep_headings_and_line_ranges():
     chunks = chunk_text("# One\nalpha\n\n## Two\nbeta\n", ".md", max_chars=100)
     assert [(chunk.heading, chunk.start_line, chunk.end_line) for chunk in chunks] == [
-        ("One", 1, 3),
+        ("One", 1, 2),
         ("Two", 4, 5),
     ]
+
+
+def test_chunk_keeps_first_line_indentation_and_locates_nonblank_lines():
+    """Leading blank lines are dropped but the first kept line keeps its indent,
+    and start_line/end_line point at the first and last non-blank lines kept."""
+    text = "\n  \n    indented first\nsecond  \n\n\t\n"
+    chunks = chunk_text(text, ".txt", max_chars=100)
+    assert chunks == [Chunk("", "    indented first\nsecond  ", 3, 4)]
+
+
+def test_chunk_text_is_the_exact_source_slice_named_by_its_locators():
+    source = (
+        "\n\n    indented intro\n\n# One\n\n  body one\n\n\n## Two\n    code two\n\n"
+    )
+    lines = source.splitlines()
+    chunks = chunk_text(source, ".md", max_chars=100)
+    assert [(c.heading, c.start_line, c.end_line) for c in chunks] == [
+        ("", 3, 3),
+        ("One", 5, 7),
+        ("Two", 10, 11),
+    ]
+    for chunk in chunks:
+        assert "\n".join(lines[chunk.start_line - 1 : chunk.end_line]) == chunk.text
+        assert lines[chunk.start_line - 1].strip()
+        assert lines[chunk.end_line - 1].strip()
 
 
 def test_ingest_is_deterministic_and_records_binary_artifacts(tmp_path):

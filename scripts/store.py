@@ -828,6 +828,7 @@ class KG:
                             if kind == "node" and record["label"] == "Chunk":
                                 self._write_chunk(record)
                     self._set_meta("revision", "1")
+            self._migrate_chunk_text()
             if not rdf_existed:
                 with self.content:
                     self._set_meta("rdf_revision", "0")
@@ -871,11 +872,81 @@ class KG:
         )
         return canonical([record[field] for field in fields])
 
+    @staticmethod
+    def _stored_form(kind, record):
+        """The record as written to `records`.
+
+        Chunk text lives once, in the `chunks` table that the full-text index
+        reads. Keeping a second copy inside the record JSON roughly doubled the
+        bytes a text-heavy graph needs. Every caller writes the chunk row in the
+        same transaction (`_write_chunk`), and `_hydrate` puts the text back on read.
+        """
+        props = record.get("props") or {}
+        if (
+            kind == "node"
+            and record["label"] == "Chunk"
+            and isinstance(props.get("text"), str)
+        ):
+            record = {
+                **record,
+                "props": {k: v for k, v in props.items() if k != "text"},
+            }
+        return record
+
+    def _hydrate(self, record):
+        """Return a record with Chunk text restored from the `chunks` table."""
+        if record.get("label") != "Chunk":
+            return record
+        props = record.get("props") or {}
+        if "text" in props:
+            # Written before text was stored once, and kept inline because the
+            # two copies disagreed during migration: the record copy wins.
+            return record
+        row = self.content.execute(
+            "SELECT text FROM chunks WHERE node_iri=?",
+            (self.node_iri("Chunk", record["id"]).value,),
+        ).fetchone()
+        if row is not None:
+            record["props"] = {**props, "text": row[0]}
+        return record
+
+    def _migrate_chunk_text(self) -> None:
+        """Drop the inline copy of Chunk text that earlier versions also stored.
+
+        Only a copy identical to the indexed text is dropped; a disagreeing copy
+        stays inline and keeps precedence. VACUUM then returns the freed pages.
+        """
+        if self._meta("chunk_text_store") == "chunks":
+            return
+        stripped = 0
+        with self.content:
+            rows = self.content.execute(
+                "SELECT key, value FROM records WHERE kind='node' "
+                "AND json_extract(value, '$.label')='Chunk' "
+                "AND json_type(value, '$.props.text') = 'text'"
+            ).fetchall()
+            for key, value in rows:
+                record = strict_json(value)
+                indexed = self.content.execute(
+                    "SELECT text FROM chunks WHERE node_iri=?",
+                    (self.node_iri("Chunk", record["id"]).value,),
+                ).fetchone()
+                if indexed is None or indexed[0] != record["props"]["text"]:
+                    continue
+                self.content.execute(
+                    "UPDATE records SET value=? WHERE kind='node' AND key=?",
+                    (canonical(self._stored_form("node", record)), key),
+                )
+                stripped += 1
+            self._set_meta("chunk_text_store", "chunks")
+        if stripped:
+            self.content.execute("VACUUM")
+
     def _put(self, kind, record):
         key = self._key(kind, record)
         self.content.execute(
             "INSERT OR REPLACE INTO records VALUES (?,?,?)",
-            (kind, key, canonical(record)),
+            (kind, key, canonical(self._stored_form(kind, record))),
         )
         if kind == "node":
             self._index_node(key, record)
@@ -953,13 +1024,13 @@ class KG:
         row = self.content.execute(
             "SELECT value FROM records WHERE kind=? AND key=?", (kind, canonical(key))
         ).fetchone()
-        return strict_json(row[0]) if row else None
+        return self._hydrate(strict_json(row[0])) if row else None
 
     def _records(self, kind):
         for row in self.content.execute(
             "SELECT value FROM records WHERE kind=? ORDER BY key", (kind,)
         ):
-            yield strict_json(row[0])
+            yield self._hydrate(strict_json(row[0]))
 
     def _ensure_rdf(self):
         revision = self._meta("revision")
@@ -1328,7 +1399,7 @@ class KG:
                     row = self.content.execute(
                         "SELECT value FROM records WHERE kind=? AND key=?", (kind, key)
                     ).fetchone()
-                    previous = strict_json(row[0]) if row else None
+                    previous = self._hydrate(strict_json(row[0])) if row else None
                     props = dict(previous.get("props", {})) if previous else {}
                     for prop, value in (incoming.get("props") or {}).items():
                         merged = _merge_set_prop(
@@ -2197,7 +2268,7 @@ class KG:
                 "AND json_extract(value, '$.label') = ?",
                 (label,),
             ):
-                record = strict_json(row[0])
+                record = self._hydrate(strict_json(row[0]))
                 props = record.get("props") or {}
                 items.append(
                     {

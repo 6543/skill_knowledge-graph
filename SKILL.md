@@ -58,6 +58,8 @@ A `.graph-skill-db` package is often the memory of earlier sessions: lessons, us
 
 The ingester creates source/document/chunk records and optional lexical URL and environment-variable mentions. These mentions do not establish semantic relationships. Documents and chunks include content-based version IDs, so later ingests can retain prior evidence. The ingester hashes oversized files and records unreadable or advanced formats as `Artifact` nodes. It does not extract them.
 
+**Chunk text and locators.** Chunk text is lossless: the ingester drops only leading and trailing blank lines (empty or whitespace-only), so the first kept line keeps its indentation and the last keeps any trailing whitespace. `start_line` and `end_line` are the 1-based, inclusive numbers of the first and last non-blank lines kept. Joining source lines `start_line` through `end_line` with `\n` reproduces `Chunk.text` exactly, which makes the range safe to cite and to re-read. Blank lines between two chunks belong to neither. A line longer than the chunk limit is cut into pieces that all report that one line number, so for those pieces the range names the line, not an exact slice. For HTML the numbers count lines of the derived text (`locator_basis`), not the original markup.
+
 4. Add domain relations only where the questions need them. Discover an existing extraction or code-indexing capability first; for source code a structural indexer such as `codebase-index`, when installed, gives declarations and call edges that regular expressions cannot. Nothing here requires one. Otherwise write a small deterministic helper with the corpus, outside this skill, that emits the same neutral records. Prefer a real parser, record extractor/version/confidence, and avoid joining unrelated entities by display name.
 5. Validate and load:
 
@@ -208,7 +210,7 @@ For a broad question, such as "is there something similar to X in the ecosystem"
 
 `unmatched` means no lexical match in the selected indexed corpus. It never proves that a fact is absent. Check collection failures, extraction coverage, versions, synonyms, and schema before an absence claim. Graph absence queries describe missing modeled relations, not necessarily missing real-world facts.
 
-Search includes up to eight evidence chunks, preserving their metadata. Snippets focus on a matching span and report character offsets; line ranges describe the whole chunk. Use `show --label Chunk --id ...` to read the full text. Inspect `evidence_truncated` and `capped_terms`; raise `--candidate-limit` or narrow the source if candidate capping could hide relevant evidence.
+Search includes up to eight evidence chunks, preserving their metadata. Snippets focus on a matching span and report character offsets; line ranges describe the whole chunk, from its first to its last non-blank line (see "Chunk text and locators"). Use `show --label Chunk --id ...` to read the full text. Inspect `evidence_truncated` and `capped_terms`; raise `--candidate-limit` or narrow the source if candidate capping could hide relevant evidence.
 
 ## Portable graphs: `.graph-skill-db`
 

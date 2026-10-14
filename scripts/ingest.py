@@ -185,47 +185,50 @@ def url_host(url: str) -> str:
 
 
 def chunk_text(text: str, suffix: str, max_chars: int = 6000) -> list[Chunk]:
+    """Split text into chunks whose text is lossless and whose locators match it.
+
+    Only leading and trailing blank lines are dropped; the first kept line keeps
+    its indentation. start_line and end_line are the 1-based numbers of the first
+    and last non-blank lines kept, so joining those source lines reproduces
+    Chunk.text. Lines longer than max_chars are cut into pieces that all report
+    that one line number.
+    """
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
     lines = text.splitlines()
     chunks = []
-    buffer = []
+    buffer: list[tuple[int, str]] = []
     heading = ""
-    start_line = 1
 
-    def flush(end_line: int):
+    def flush():
         nonlocal buffer
-        value = "\n".join(buffer).strip()
-        if value:
-            chunks.append(Chunk(heading, value, start_line, end_line))
+        kept = [index for index, (_number, value) in enumerate(buffer) if value.strip()]
+        if kept:
+            first, last = buffer[kept[0]][0], buffer[kept[-1]][0]
+            body = "\n".join(value for _number, value in buffer[kept[0] : kept[-1] + 1])
+            chunks.append(Chunk(heading, body, first, last))
         buffer = []
 
     for line_number, line in enumerate(lines, 1):
         match = HEADING.match(line) if suffix.lower() in {".md", ".mdx"} else None
         if match and buffer:
-            flush(line_number - 1)
+            flush()
         if match:
             heading = match.group(1).strip()
-            start_line = line_number
 
         remaining = line
         while len(remaining) > max_chars:
-            if buffer:
-                flush(line_number - 1)
+            flush()
             chunks.append(
                 Chunk(heading, remaining[:max_chars], line_number, line_number)
             )
             remaining = remaining[max_chars:]
-            start_line = line_number
 
-        prospective = len(remaining) + sum(len(item) + 1 for item in buffer)
+        prospective = len(remaining) + sum(len(value) + 1 for _number, value in buffer)
         if buffer and prospective > max_chars:
-            flush(line_number - 1)
-            start_line = line_number
-        if not buffer:
-            start_line = line_number
-        buffer.append(remaining)
-    flush(len(lines))
+            flush()
+        buffer.append((line_number, remaining))
+    flush()
     return chunks
 
 

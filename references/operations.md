@@ -53,6 +53,8 @@ Merging never deletes, so an older package brings back whatever a later cleanup 
 
 ## Node search
 
+Chunk text is stored once, in the table its full-text index reads; the `Chunk` record omits it and reads put it back, so exports and `show` are unchanged. A graph written by an earlier version drops its second copy on first open and runs one `VACUUM`; a copy that disagrees with the index stays and wins.
+
 Besides chunk text, SQLite keeps a full-text index over every non-Chunk node: label, ID, and all string values in its properties (each capped at 4,000 characters). Writes, source refresh, deletion, and replacement keep it in step; a graph written before the index existed builds it on first open. `find` and the `nodes` part of `search` rank it by term coverage, then BM25. Ingester labels are excluded unless requested, because they outnumber knowledge nodes by orders of magnitude.
 
 `brief` reads records directly. Its default labels are the memory labels in [modeling](modeling.md#session-memory); a node's date is the first ISO date among `observed`, `observed_at`, `found`, `date`, `updated`, `created`, else a date inside its `source` name.
