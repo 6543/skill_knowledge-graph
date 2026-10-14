@@ -25,7 +25,9 @@ A missing RDF directory can be rebuilt from the SQLite records. For a damaged RD
 
 ## Merge and ownership
 
-Default `load` and `import` merge. Properties omitted from an incoming node or edge remain unchanged. Equal values are idempotent, including nested JSON values. Conflicting fields abort the entire batch. `--on-conflict incoming` explicitly authorizes overwriting supplied conflicting fields; it retains unspecified fields and does not preserve overwritten history. Prefer version or assertion nodes when both values are meaningful.
+Default `load` and `import` merge. Properties omitted from an incoming node or edge remain unchanged. Equal values are idempotent, including nested JSON values. Conflicting fields abort the entire batch. `--on-conflict incoming` explicitly authorizes overwriting supplied conflicting fields; it retains unspecified fields and does not preserve overwritten history. Prefer version or assertion nodes when both values are meaningful. One exception: `Source.roots` is provenance, not a fact, so it merges as a sorted set of strings. Ingesting or importing the same source from a differently named checkout adds the new root instead of aborting. Non-list values or non-string items still conflict normally.
+
+The ingester records `Source.roots` as the basename of each input. Pass `ingest.py --root-name NAME` to record `NAME` instead, for example to keep a stable name when the checkout directory is named differently. It requires exactly one input, because with several inputs each document path is prefixed by its own input name.
 
 `load --replace` replaces the whole graph. `load --source NAME` refreshes that source and rejects batches tagged to other sources. Edge endpoints may resolve against surviving external nodes. `drop-source --source NAME` retires it. These operations are explicit and destructive.
 

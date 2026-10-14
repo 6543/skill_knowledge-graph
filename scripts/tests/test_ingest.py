@@ -127,3 +127,66 @@ def test_virtualenvs_and_vendored_trees_are_not_ingested(tmp_path):
 
     paths = {node["props"]["path"] for node in nodes if node["label"] == "Document"}
     assert paths == {"README.md"}
+
+
+def test_same_source_from_differently_named_roots_merges_roots(tmp_path, monkeypatch):
+    """Re-ingesting one source from another checkout name must not conflict.
+
+    Source.roots records where a corpus was read from; a second checkout of the
+    same corpus under another directory name is additional provenance, not a
+    contradiction, so merges keep the union instead of rejecting the batch.
+    """
+    from store import KG
+
+    first_root = tmp_path / "trivy"
+    second_root = tmp_path / "plugin-trivy"
+    for root, text in ((first_root, "old content"), (second_root, "new content")):
+        root.mkdir()
+        (root / "notes.md").write_text(text)
+    first = build_graph([first_root], "plugin-trivy")
+    second = build_graph([second_root], "plugin-trivy")
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    with KG("roots", create=True) as graph:
+        graph.load(*first)
+        graph.load(*second)
+        graph.load(*second)  # idempotent
+        assert graph.props("Source", "plugin-trivy")["roots"] == [
+            "plugin-trivy",
+            "trivy",
+        ]
+        assert graph.stats()["labels"]["Document"] == 2
+
+
+def test_same_source_from_a_then_b_merges_roots_on_import(tmp_path, monkeypatch):
+    """Ingest --source X from a/, then from b/, and merge both through import."""
+    from store import KG
+
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "notes.md").write_text(f"content from {name}")
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    package = tmp_path / "b.graph-skill-db"
+    with KG("from-b", create=True) as graph:
+        graph.load(*build_graph([tmp_path / "b"], "X"))
+        graph.export_package(package)
+    with KG("merged", create=True) as graph:
+        graph.load(*build_graph([tmp_path / "a"], "X"))
+        graph.import_package(package)
+        assert graph.props("Source", "X")["roots"] == ["a", "b"]
+
+
+def test_root_name_overrides_recorded_root(tmp_path):
+    checkout = tmp_path / "plugin-trivy"
+    checkout.mkdir()
+    (checkout / "notes.md").write_text("hello")
+    nodes, _edges = build_graph([checkout], "X", root_name="trivy")
+    source = next(node for node in nodes if node["label"] == "Source")
+    assert source["props"]["roots"] == ["trivy"]
+
+
+def test_root_name_rejects_multiple_inputs(tmp_path):
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "notes.md").write_text(name)
+    with pytest.raises(ValueError, match="root"):
+        build_graph([tmp_path / "a", tmp_path / "b"], "X", root_name="c")

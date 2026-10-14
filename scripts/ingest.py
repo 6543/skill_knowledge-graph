@@ -294,14 +294,23 @@ def build_graph(
     max_file_bytes: int = 20_000_000,
     mentions: bool = True,
     links: bool = True,
+    root_name: str | None = None,
 ):
     if not inputs or not source_name or max_chars <= 0 or max_file_bytes <= 0:
         raise ValueError("inputs, source name and positive size limits are required")
+    # With several inputs, document paths are prefixed by each input's own name,
+    # so one override name could not match them.
+    if root_name is not None and (not root_name or len(inputs) != 1):
+        raise ValueError("root name must be non-empty and needs exactly one input")
     builder = Builder()
     # Roots stay as given rather than resolved: an absolute path bakes one machine's
     # layout into the records, so the same corpus would export differently on every
     # machine and two people's packages could never be compared.
-    roots = sorted(path.resolve().name for path in inputs)
+    roots = (
+        [root_name]
+        if root_name is not None
+        else sorted(path.resolve().name for path in inputs)
+    )
     builder.node("Source", source_name, name=source_name, roots=roots)
     for path, relative in discover(inputs):
         size = path.stat().st_size
@@ -427,6 +436,11 @@ def main():
     parser.add_argument("--max-file-bytes", type=int, default=20_000_000)
     parser.add_argument("--jsonl", action="store_true")
     parser.add_argument(
+        "--root-name",
+        help="record this name as the Source root instead of the input's basename"
+        " (single input only)",
+    )
+    parser.add_argument(
         "--no-mentions",
         action="store_true",
         help="skip generic environment-variable mention edges",
@@ -442,6 +456,7 @@ def main():
         args.max_file_bytes,
         mentions=not args.no_mentions,
         links=not args.no_links,
+        root_name=args.root_name,
     )
     write_records(args.nodes, nodes, args.jsonl)
     write_records(args.edges, edges, args.jsonl)

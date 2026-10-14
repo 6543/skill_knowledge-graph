@@ -187,6 +187,24 @@ def _blob_candidates(relative: str, root: Path):
         yield root / tail
 
 
+# Properties that record accumulated provenance rather than a single fact.
+# Reading the same corpus from another checkout name adds a root; it does not
+# contradict the earlier one, so these merge as sorted string sets.
+SET_PROPERTIES = {("node", "Source", "roots")}
+
+
+def _merge_set_prop(kind, record, prop, current, value):
+    """Union for set-valued provenance props; None means normal conflict rules."""
+    if (kind, record.get("label"), prop) not in SET_PROPERTIES:
+        return None
+    lists = [v for v in (current, value) if v is not None]
+    if not all(
+        isinstance(v, list) and all(isinstance(i, str) for i in v) for v in lists
+    ):
+        return None
+    return sorted({item for v in lists for item in v})
+
+
 def resolve_blobs(
     nodes,
     roots,
@@ -1006,6 +1024,12 @@ class KG:
                     previous = strict_json(row[0]) if row else None
                     props = dict(previous.get("props", {})) if previous else {}
                     for prop, value in (incoming.get("props") or {}).items():
+                        merged = _merge_set_prop(
+                            kind, incoming, prop, props.get(prop), value
+                        )
+                        if merged is not None:
+                            props[prop] = merged
+                            continue
                         if (
                             prop in props
                             and canonical(props[prop]) != canonical(value)

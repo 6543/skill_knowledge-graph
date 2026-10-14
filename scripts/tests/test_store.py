@@ -142,3 +142,22 @@ def test_json_and_jsonl_input_are_compatible(tmp_path):
     from store import read_records
 
     assert list(read_records(array_path)) == list(read_records(lines_path))
+
+
+def test_only_source_roots_merge_as_a_set_other_fields_still_conflict(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KG_HOME", str(tmp_path))
+    source = lambda **props: {"label": "Source", "id": "s", "props": props}
+    with KG("roots-scope", create=True) as graph:
+        graph.load([source(name="s", roots=["b", "a"])], [])
+        graph.load([source(roots=["c", "a"])], [])
+        assert graph.props("Source", "s")["roots"] == ["a", "b", "c"]
+        with pytest.raises(GraphValidationError, match="conflict"):
+            graph.load([source(name="other")], [])
+        other = {"label": "Thing", "id": "t", "props": {"roots": ["a"]}}
+        graph.load([other], [])
+        with pytest.raises(GraphValidationError, match="conflict"):
+            graph.load([{**other, "props": {"roots": ["b"]}}], [])
+        with pytest.raises(GraphValidationError, match="conflict"):
+            graph.load([source(roots="not-a-list")], [])

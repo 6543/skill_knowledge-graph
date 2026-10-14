@@ -47,7 +47,7 @@ Standalone `validate` expects a self-contained batch. `load` also validates incr
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" load project --nodes nodes.jsonl
 ```
 
-**Normal loads and imports merge.** Continue adding newly learned facts while working. Missing fields never delete existing properties. Identical records are idempotent. An incoming value that conflicts with an existing field aborts the whole batch, preserving the current graph. Inspect the collision: qualify unrelated IDs, model differing claims as separate evidence-backed nodes, or use version IDs. Use `--on-conflict incoming` only for an intentionally requested correction; it overwrites supplied conflicting fields and retains unspecified fields. It does not preserve the overwritten values as history, so export a checkpoint when they matter.
+**Normal loads and imports merge.** Continue adding newly learned facts while working. Missing fields never delete existing properties. Identical records are idempotent. An incoming value that conflicts with an existing field aborts the whole batch, preserving the current graph. `Source.roots` is the one exception: it merges as a set, so re-ingesting a source from another checkout name is safe. Inspect the collision: qualify unrelated IDs, model differing claims as separate evidence-backed nodes, or use version IDs. Use `--on-conflict incoming` only for an intentionally requested correction; it overwrites supplied conflicting fields and retains unspecified fields. It does not preserve the overwritten values as history, so export a checkpoint when they matter.
 
 | Intent | Command mode | Effect |
 |---|---|---|
