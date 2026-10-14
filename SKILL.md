@@ -12,12 +12,15 @@ Keep durable knowledge as neutral records, with explicit relations and source ev
 Find this skill's directory at runtime. Put the environment, corpus outputs, and graph data in the project workspace, outside the skill and raw input roots. Replace `SKILL_ROOT` below with the discovered directory; use an absolute `KG_HOME` when changing working directories.
 
 ```bash
-python3 -m venv .venv-kg
-.venv-kg/bin/pip install -r "$SKILL_ROOT/requirements.txt"
+python3 "$SKILL_ROOT/scripts/bootstrap.py" --venv .venv-kg
 export KG_HOME="$PWD/knowledge-data"
 ```
 
-Python 3.10+, SQLite with FTS5, and pyoxigraph 0.5.x are required. One process may open a named graph at a time. Use one `KG` instance per graph and close it, preferably with a context manager.
+Python 3.10+, SQLite with FTS5, and pyoxigraph 0.5.x are required. `bootstrap.py` uses only the standard library. It creates the virtualenv, installs `requirements.txt` from the package index, and when that fails (or with `--offline`) installs the pyoxigraph wheel bundled in `vendor/wheels/` after checking its SHA-256. A rerun leaves a working install alone.
+
+The bundled wheel runs only on Linux x86_64 with glibc 2.28+ and CPython 3.8+. Elsewhere the script needs the network: PyPI has prebuilt wheels for Linux aarch64, macOS and Windows. Where none fits, pip builds pyoxigraph from source, which needs a Rust toolchain, maturin and access to crates.io; on NixOS use `python3Packages.pyoxigraph` from nixpkgs. Offline on such a machine, the script stops and says so; tell the user rather than retrying. Packages no longer need to carry runtime wheels for this skill.
+
+One process may open a named graph at a time. Use one `KG` instance per graph and close it, preferably with a context manager.
 
 ## Session memory
 

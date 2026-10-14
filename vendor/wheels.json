@@ -1,0 +1,20 @@
+{
+  "note": "Offline fallback for scripts/bootstrap.py. Linux x86_64 with glibc >= 2.28 and CPython >= 3.8 only; other platforms install from PyPI or build from source.",
+  "wheels": [
+    {
+      "distribution": "pyoxigraph",
+      "version": "0.5.11",
+      "file": "pyoxigraph-0.5.11-cp38-abi3-manylinux_2_28_x86_64.whl",
+      "sha256": "ed906c05164d4766046a899f5944b4cf63309e717e3f464b2c0c80e8de91fa16",
+      "bytes": 8185704,
+      "system": "Linux",
+      "machines": ["x86_64", "AMD64"],
+      "libc": "glibc",
+      "min_libc_version": "2.28",
+      "implementation": "CPython",
+      "min_python": "3.8",
+      "license": "MIT OR Apache-2.0",
+      "source": "https://pypi.org/project/pyoxigraph/0.5.11/"
+    }
+  ]
+}
