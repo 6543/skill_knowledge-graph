@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from store import (
     KG,
+    LARGE_BLOB_BYTES,
     MAX_PACKAGE_BYTES,
     MIN_SCORE,
     GraphValidationError,
@@ -61,9 +62,39 @@ def build_parser():
     export = command("export", help="write a portable .graph-skill-db archive")
     export.add_argument("--out", type=Path, required=True)
     export.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
+    export.add_argument(
+        "--raw-root",
+        type=Path,
+        action="append",
+        dest="raw_roots",
+        default=[],
+        help="ingest root holding the raw files behind Artifact records; repeatable",
+    )
+    export.add_argument(
+        "--no-blobs",
+        dest="blobs",
+        action="store_false",
+        help="records only; do not carry raw artifact bytes",
+    )
+    export.add_argument(
+        "--large-bytes",
+        type=int,
+        default=LARGE_BLOB_BYTES,
+        help="size above which an artifact is deferred instead of packed",
+    )
+    export.add_argument(
+        "--include-large",
+        action="store_true",
+        help="pack deferred oversized artifacts; ask the user before using this",
+    )
 
     importer = command("import", help="merge a .graph-skill-db archive into a graph")
     importer.add_argument("--file", type=Path, required=True)
+    importer.add_argument(
+        "--blob-dir",
+        type=Path,
+        help="unpack the package's raw artifact bytes into this object store",
+    )
     importer.add_argument(
         "--on-conflict", choices=("error", "incoming"), default="error"
     )
@@ -143,7 +174,14 @@ def main():
         )
     if args.command == "inspect":
         manifest, nodes, edges = KG.read_package(args.file, max_bytes=args.max_bytes)
-        return output({**manifest, "read_nodes": len(nodes), "read_edges": len(edges)})
+        return output(
+            {
+                **manifest,
+                "read_nodes": len(nodes),
+                "read_edges": len(edges),
+                "read_blobs": len(manifest.get("blobs") or {}),
+            }
+        )
 
     creating = args.command in {"load", "import"}
     graph = KG(args.graph, create=creating)
@@ -172,10 +210,20 @@ def run(args, graph):
                 replace=args.replace,
                 on_conflict=args.on_conflict,
                 max_bytes=args.max_bytes,
+                blob_dir=args.blob_dir,
             )
         )
     if args.command == "export":
-        return output(graph.export_package(args.out, max_bytes=args.max_bytes))
+        return output(
+            graph.export_package(
+                args.out,
+                max_bytes=args.max_bytes,
+                raw_roots=args.raw_roots,
+                blobs=args.blobs,
+                large_bytes=args.large_bytes,
+                include_large=args.include_large,
+            )
+        )
     if args.command == "dump":
         nodes, edges = graph.export_records()
         return output(

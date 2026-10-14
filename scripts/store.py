@@ -27,9 +27,12 @@ JSON_TYPE = ox.NamedNode("urn:graph-skill-db:json")
 
 PACKAGE_SUFFIX = ".graph-skill-db"
 PACKAGE_FORMAT = "graph-skill-db"
-PACKAGE_VERSION = 2
+PACKAGE_VERSION = 3
 PACKAGE_MEMBERS = {"manifest.json", "nodes.jsonl", "edges.jsonl"}
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
+BLOB_PREFIX = "blobs/"
+BLOB_NAME = re.compile(r"^[0-9a-f]{64}$")
+LARGE_BLOB_BYTES = 100 * 1024 * 1024
 
 
 def canonical(value):
@@ -174,6 +177,120 @@ class GraphValidationError(ValueError):
 
 def graph_home() -> Path:
     return Path(os.environ.get("KG_HOME", ".kg"))
+
+
+def _blob_candidates(relative: str, root: Path):
+    """A record's path is relative to one ingest root, with or without its name."""
+    yield root / relative
+    head, _, tail = relative.partition("/")
+    if tail and head == root.name:
+        yield root / tail
+
+
+def resolve_blobs(
+    nodes,
+    roots,
+    large_bytes: int = LARGE_BLOB_BYTES,
+    include_large: bool = False,
+) -> dict:
+    """Locate the raw files behind Artifact records under the given roots.
+
+    Matching is content addressed: a candidate path only counts when its
+    sha256 equals the digest recorded at ingest, so a file edited since then
+    is reported rather than silently exported as the original evidence.
+    Artifacts larger than large_bytes are deferred until explicitly included.
+    """
+    roots = [Path(root) for root in roots]
+    blobs: dict[str, Path] = {}
+    missing, changed, oversized = [], [], []
+    for node in nodes:
+        if node.get("label") != "Artifact":
+            continue
+        props = node.get("props") or {}
+        digest, relative = props.get("sha256"), props.get("path")
+        if not isinstance(digest, str) or not BLOB_NAME.match(digest):
+            continue
+        if not isinstance(relative, str) or not relative or digest in blobs:
+            continue
+        state, resolved = "missing", None
+        for root in roots:
+            for candidate in _blob_candidates(relative, root):
+                if not candidate.is_file() or candidate.is_symlink():
+                    continue
+                size = candidate.stat().st_size
+                if size > large_bytes and not include_large:
+                    state, resolved = "oversized", size
+                    break
+                if stream_sha256(candidate) != digest:
+                    state = "changed" if state == "missing" else state
+                    continue
+                state, resolved = "found", candidate
+                break
+            if state in ("found", "oversized"):
+                break
+        if state == "found":
+            blobs[digest] = resolved
+        elif state == "oversized":
+            oversized.append({"path": relative, "size_bytes": resolved})
+        elif state == "changed":
+            changed.append(relative)
+        else:
+            missing.append(relative)
+    return {
+        "blobs": blobs,
+        "missing": sorted(missing),
+        "changed": sorted(changed),
+        "oversized": sorted(oversized, key=lambda item: item["path"]),
+    }
+
+
+def skipped_blobs(manifest: dict) -> dict:
+    available = manifest.get("blobs") or {}
+    return {"extracted": 0, "bytes": 0, "available": len(available)}
+
+
+def extract_blobs(package: str | Path, blob_dir: str | Path) -> dict:
+    """Unpack the package's object store into a sharded content-addressed tree.
+
+    Every member is verified against its own name before it lands on disk, so a
+    tampered or truncated archive cannot install bytes under a trusted digest.
+    Names come from the digest, never from the archive, so no member can escape
+    the target directory.
+    """
+    blob_dir = Path(blob_dir)
+    written, total = 0, 0
+    with zipfile.ZipFile(package) as archive:
+        names = [n for n in archive.namelist() if n.startswith(BLOB_PREFIX)]
+        for name in sorted(names):
+            digest = name[len(BLOB_PREFIX) :]
+            if not BLOB_NAME.match(digest):
+                raise GraphValidationError(f"{name}: not a sha256 blob name")
+            data = archive.read(name)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise GraphValidationError(f"{name}: blob checksum mismatch")
+            target = blob_dir / digest[:2] / digest
+            if target.exists() and target.read_bytes() == data:
+                total += len(data)
+                written += 1
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=digest + ".", dir=target.parent)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            written += 1
+            total += len(data)
+    return {"extracted": written, "bytes": total, "dir": str(blob_dir)}
+
+
+def stream_sha256(path: Path, block: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def read_records(path: str | Path):
@@ -1059,14 +1176,35 @@ class KG:
         return list(self._records("node")), list(self._records("edge"))
 
     def export_package(
-        self, path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES
+        self,
+        path: str | Path,
+        max_bytes: int = MAX_PACKAGE_BYTES,
+        raw_roots=(),
+        blobs: bool = True,
+        large_bytes: int = LARGE_BLOB_BYTES,
+        include_large: bool = False,
     ) -> dict:
-        """Atomically export portable neutral records in a ZIP container."""
+        """Atomically export portable neutral records in a ZIP container.
+
+        Referenced raw files are carried alongside the records as a
+        content-addressed object store under blobs/, so an import can restore
+        the evidence that Artifact records only point at.
+        """
         path = Path(path)
         if not path.name.endswith(PACKAGE_SUFFIX):
             path = path.with_name(path.name + PACKAGE_SUFFIX)
         path.parent.mkdir(parents=True, exist_ok=True)
         nodes, edges = self.export_records()
+        found = (
+            resolve_blobs(
+                nodes, raw_roots, large_bytes=large_bytes, include_large=include_large
+            )
+            if blobs and raw_roots
+            else {"blobs": {}, "missing": [], "changed": [], "oversized": []}
+        )
+        stored = {
+            digest: source.read_bytes() for digest, source in found["blobs"].items()
+        }
         payloads = {
             name: "".join(canonical(r) + "\n" for r in records).encode("utf-8")
             for name, records in (("nodes.jsonl", nodes), ("edges.jsonl", edges))
@@ -1088,11 +1226,16 @@ class KG:
                 name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                 for name, data in payloads.items()
             },
+            "blobs": {digest: len(data) for digest, data in sorted(stored.items())},
         }
         payloads["manifest.json"] = canonical(manifest).encode("utf-8")
-        if sum(map(len, payloads.values())) > max_bytes:
+        if (
+            sum(map(len, payloads.values())) + sum(map(len, stored.values()))
+            > max_bytes
+        ):
             raise GraphValidationError(
-                "package exceeds max_bytes; shard the corpus or explicitly raise the limit"
+                "package exceeds max_bytes; shard the corpus, drop blobs with "
+                "--no-blobs, or explicitly raise the limit"
             )
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
         try:
@@ -1102,13 +1245,26 @@ class KG:
                 ) as archive:
                     for name, data in payloads.items():
                         archive.writestr(name, data)
+                    for digest, data in sorted(stored.items()):
+                        archive.writestr(BLOB_PREFIX + digest, data)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-        return {**manifest, "package": str(path), "bytes": path.stat().st_size}
+        return {
+            **manifest,
+            "package": str(path),
+            "bytes": path.stat().st_size,
+            "blobs": {
+                "stored": len(stored),
+                "bytes": sum(map(len, stored.values())),
+                "missing": found["missing"],
+                "changed": found["changed"],
+                "oversized": found["oversized"],
+            },
+        }
 
     @staticmethod
     def read_package(path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES):
@@ -1126,9 +1282,18 @@ class KG:
                     raise GraphValidationError(
                         f"{path}: archive is missing {sorted(missing)}"
                     )
-                if len(names) != 3 or set(names) != PACKAGE_MEMBERS:
+                blob_names = [name for name in names if name.startswith(BLOB_PREFIX)]
+                if len(names) != len(set(names)) or set(names) - PACKAGE_MEMBERS - set(
+                    blob_names
+                ):
                     raise GraphValidationError(
                         "duplicate or unexpected archive members"
+                    )
+                if any(
+                    not BLOB_NAME.match(name[len(BLOB_PREFIX) :]) for name in blob_names
+                ):
+                    raise GraphValidationError(
+                        "blob members must be named by their sha256 digest"
                     )
                 if sum(entry.file_size for entry in entries) > max_bytes:
                     raise GraphValidationError("package exceeds max_bytes")
@@ -1154,8 +1319,23 @@ class KG:
                         f"{path}: not a {PACKAGE_FORMAT} archive"
                     )
                 version = manifest.get("version")
-                if type(version) is not int or version not in (1, PACKAGE_VERSION):
+                if type(version) is not int or not 1 <= version <= PACKAGE_VERSION:
                     raise GraphValidationError("unsupported package version")
+                declared = manifest.get("blobs") if version >= 3 else {}
+                if not isinstance(declared, dict) or any(
+                    not isinstance(digest, str)
+                    or not BLOB_NAME.match(digest)
+                    or type(size) is not int
+                    or size < 0
+                    for digest, size in declared.items()
+                ):
+                    raise GraphValidationError("invalid manifest blobs")
+                if set(declared) != {name[len(BLOB_PREFIX) :] for name in blob_names}:
+                    raise GraphValidationError("manifest blob set mismatch")
+                for name in blob_names:
+                    entry = archive.getinfo(name)
+                    if entry.file_size != declared[name[len(BLOB_PREFIX) :]]:
+                        raise GraphValidationError(f"{name}: byte count mismatch")
                 counts = manifest.get("counts")
                 if not isinstance(counts, dict) or any(
                     type(counts.get(k)) is not int or counts[k] < 0
@@ -1165,7 +1345,7 @@ class KG:
                 payloads = {
                     name: archive.read(name) for name in ("nodes.jsonl", "edges.jsonl")
                 }
-                if version == 2:
+                if version >= 2:
                     checks = manifest.get("members")
                     if not isinstance(checks, dict) or set(checks) != set(payloads):
                         raise GraphValidationError("missing member checksums")
@@ -1192,7 +1372,7 @@ class KG:
                 if len(nodes) != counts["nodes"] or len(edges) != counts["edges"]:
                     raise GraphValidationError("manifest record count mismatch")
                 validate_graph(nodes, edges)
-                if version == 2:
+                if version >= 2:
                     actual_sources = sorted(
                         {n["id"] for n in nodes if n["label"] == "Source"}
                         | set().union(*(KG._owners(n) for n in nodes))
@@ -1223,6 +1403,7 @@ class KG:
         replace: bool = False,
         on_conflict: str = "error",
         max_bytes: int = MAX_PACKAGE_BYTES,
+        blob_dir: str | Path | None = None,
     ) -> dict:
         manifest, nodes, edges = self.read_package(path, max_bytes=max_bytes)
         result = self.load(nodes, edges, replace=replace, on_conflict=on_conflict)
@@ -1231,8 +1412,11 @@ class KG:
             "package": str(path),
             "manifest": manifest,
             "integrity": "sha256"
-            if manifest["version"] == 2
+            if manifest["version"] >= 2
             else "legacy-no-checksums",
+            "blobs": extract_blobs(path, blob_dir)
+            if blob_dir
+            else skipped_blobs(manifest),
         }
 
     # -------------------------------------------------------------------- read

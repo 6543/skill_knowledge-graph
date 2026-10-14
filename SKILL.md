@@ -85,7 +85,7 @@ Search includes up to eight evidence chunks, preserving their metadata. Snippets
 
 ## Portable graphs: `.graph-skill-db`
 
-A `.graph-skill-db` is a ZIP container holding exactly `manifest.json`, `nodes.jsonl`, and `edges.jsonl`. It contains neutral JSON data and chunk text, with no executable extractor or binary database. Original media and raw files remain separate; preserve their locators and digests.
+A `.graph-skill-db` is a ZIP container holding `manifest.json`, `nodes.jsonl`, `edges.jsonl`, and optionally a content-addressed object store of raw artifact bytes under `blobs/<sha256>`. The records are neutral JSON and chunk text, with no executable extractor or binary database.
 
 ```bash
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" export project --out handover.graph-skill-db
@@ -93,9 +93,24 @@ A `.graph-skill-db` is a ZIP container holding exactly `manifest.json`, `nodes.j
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" import project --file handover.graph-skill-db
 ```
 
+### Raw artifacts in the package
+
+`Artifact` records only point at raw files the ingester could not extract: binaries, media, and anything over `--max-file-bytes`. Carry those bytes along so the receiver does not inherit dangling references:
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" export project --out handover \
+  --raw-root RAW_PATH
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" import project --file handover.graph-skill-db \
+  --blob-dir raw-store
+```
+
+Blobs travel by default once a `--raw-root` is given; `--no-blobs` keeps the export record-only. Files are matched by digest, not by path, so a file edited since ingest is reported as `changed` and left out rather than passed off as the original evidence. Missing files are reported the same way and do not abort the export. Import writes `raw-store/ab/abcdef…`; without `--blob-dir` the blobs stay in the package.
+
+**Artifacts over 100 MiB are never packed silently.** They come back as `oversized` in the export report. Ask the user whether to include them before rerunning with `--include-large`, and say what it costs: package size, transfer time, and memory, since one blob is held whole at a time. Adjust the threshold with `--large-bytes`.
+
 Inspect the validated manifest and summarize incoming sources/counts. Then merge into the existing graph, or create the named graph if none exists. Keep adding knowledge after import and export the accumulated result for handover. Reimporting unchanged records does not duplicate them.
 
-Exports use format version 2 with member byte counts and SHA-256 checksums. Version 1 draft packages are accepted without checksum assurance; their earlier loss of JSON types cannot be reconstructed. Import validates the whole package before modifying records. No archive members are extracted or executed. The default uncompressed package limit is 512 MiB, configurable with `--max-bytes`; see the complete contract in [operations](references/operations.md). Checksums detect inconsistency, not authorship or trustworthiness.
+Exports use format version 3 with member byte counts and SHA-256 checksums, and a digest for every blob. Version 2 packages carry records only and stay readable; version 1 draft packages are accepted without checksum assurance; their earlier loss of JSON types cannot be reconstructed. Import validates the whole package before modifying records. Records are read as data and no member is ever executed; blobs are written to disk only when `--blob-dir` asks for it. Blobs are verified against their own name before extraction and land under digest-derived paths, so no member can escape the target directory. The default uncompressed package limit is 512 MiB and now covers blobs too, configurable with `--max-bytes`; see the complete contract in [operations](references/operations.md). Checksums detect inconsistency, not authorship or trustworthiness.
 
 ## Material requiring other capabilities
 
