@@ -157,6 +157,33 @@ def test_same_source_from_differently_named_roots_merges_roots(tmp_path, monkeyp
         assert graph.stats()["labels"]["Document"] == 2
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("see https://example.org/docs.", ["https://example.org/docs"]),
+        ("`http://localhost:8000`", ["http://localhost:8000"]),
+        ("run on http://localhost:3000; then", ["http://localhost:3000"]),
+        (
+            "list https://a.example/x, https://b.example/y",
+            ["https://a.example/x", "https://b.example/y"],
+        ),
+        ('"url":"http://ccmenu.org/\\nThe next"', ["http://ccmenu.org/"]),
+        ("[docs](https://example.org/a_(b))", ["https://example.org/a_(b)"]),
+        ("tpl http://localhost:${port}/api", ["http://localhost:${port}/api"]),
+        ("*https://example.org/bold*", ["https://example.org/bold"]),
+        ("junk http://. and http://... and http://\\x00bad", []),
+        ("host “https://woodpecker.example.com” done", ["https://woodpecker.example.com"]),
+        ("«https://example.org/a» ‹https://example.org/b›", ["https://example.org/a", "https://example.org/b"]),
+        ("見る https://example.org/jp。次", ["https://example.org/jp"]),
+        ("say ‘https://example.org/q’", ["https://example.org/q"]),
+    ],
+)
+def test_url_mentions_drop_surrounding_punctuation_and_escapes(text, expected):
+    from ingest import url_mentions
+
+    assert url_mentions(text) == sorted(expected)
+
+
 def test_same_source_from_a_then_b_merges_roots_on_import(tmp_path, monkeypatch):
     """Ingest --source X from a/, then from b/, and merge both through import."""
     from store import KG

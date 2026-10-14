@@ -1,6 +1,6 @@
 ---
 name: knowledge-graph
-description: Build, grow, query, and exchange persistent evidence-backed knowledge graphs from documents, code, research, infrastructure, logs, web snapshots, and text derived from media. Use for cross-source relations, provenance, coverage, graph benchmarks, and any .graph-skill-db package. Imports merge with existing knowledge. Skip a single-file lookup that direct reading fully answers.
+description: Build, grow, query, and exchange persistent evidence-backed knowledge graphs from documents, code, research, infrastructure, logs, web snapshots, and text derived from media. Also the session memory that carries lessons learned, conventions, pitfalls, and open questions between sessions via .graph-skill-db packages. Use for cross-source relations, provenance, coverage, graph benchmarks, recalling or recording what was learned before, and any .graph-skill-db package. Imports merge with existing knowledge. Skip a single-file lookup that direct reading fully answers.
 ---
 
 # Knowledge Graph
@@ -18,6 +18,32 @@ export KG_HOME="$PWD/knowledge-data"
 ```
 
 Python 3.10+, SQLite with FTS5, and pyoxigraph 0.5.x are required. One process may open a named graph at a time. Use one `KG` instance per graph and close it, preferably with a context manager.
+
+## Session memory
+
+A `.graph-skill-db` package is often the memory of earlier sessions: lessons, user conventions, skill issues, open questions, plus the evidence behind them. Use it so the same mistake is not made twice and nothing learned is lost.
+
+**Start of a session** (a package is uploaded or mentioned):
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" import project --file memory.graph-skill-db
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" brief project
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" find project --text 'git identity for patches'
+```
+
+`brief` lists memory labels (`Lesson`, `Convention`, `Preference`, `Decision`, `Pitfall`, `SkillIssue`, `OpenQuestion`, `Finding`, `Todo`) newest first and counts every other label. Read it before planning. Before each non-trivial step, `find` (or `search`, which returns matching nodes beside chunks) with the task's key terms. A matching convention or lesson overrides habit. Name what you applied only when it changes what you do.
+
+**While working**, record as soon as something is learned, not at the end:
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" note project --label Lesson \
+  --text 'Verify every patch series with git am in a detached worktree' \
+  --supported-by Chunk:CHUNK_ID --about Skill:skill:git-patch-workflow
+```
+
+`note` sets `statement`, `observed` (UTC date), `source` (`session-<date>`), and an ID from the text; override with `--id`, `--source`, `--prop KEY=VALUE`, `--link REL=LABEL:ID`. Record a correction the user had to make, a failed approach with its reason, a working command sequence, a user preference, or a skill defect with a repair prompt. Do not record what the sources already say; link to their chunks instead. References are `LABEL:ID` and must already exist; a miss suggests close IDs. Re-noting the same statement is a no-op; the same ID with different text is a conflict: reword into a new ID, or pass `--on-conflict incoming` for an intended update.
+
+**End of a session**, or whenever the user asks for the package: `export` and present it. Imported raw artifact bytes are kept with the graph and travel on automatically. See [modeling](references/modeling.md#session-memory) for memory labels and IDs.
 
 ## Build and grow
 
@@ -47,6 +73,8 @@ Standalone `validate` expects a self-contained batch. `load` also validates incr
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" load project --nodes nodes.jsonl
 ```
 
+A rejected merge lists every conflicting field at once. Preview a large or unfamiliar import with `--dry-run` first.
+
 **Normal loads and imports merge.** Continue adding newly learned facts while working. Missing fields never delete existing properties. Identical records are idempotent. An incoming value that conflicts with an existing field aborts the whole batch, preserving the current graph. `Source.roots` is the one exception: it merges as a set, so re-ingesting a source from another checkout name is safe. Inspect the collision: qualify unrelated IDs, model differing claims as separate evidence-backed nodes, or use version IDs. Use `--on-conflict incoming` only for an intentionally requested correction; it overwrites supplied conflicting fields and retains unspecified fields. It does not preserve the overwritten values as history, so export a checkpoint when they matter.
 
 | Intent | Command mode | Effect |
@@ -56,6 +84,9 @@ Standalone `validate` expects a self-contained batch. `load` also validates incr
 | Explicitly refresh one corpus | `load --source NAME` | Remove source-owned records and affected edges, then load that source's replacement |
 | Explicitly rebuild the whole graph | `load --replace` or `import --replace` | Replace all existing knowledge |
 | Explicitly retire a source | `drop-source --source NAME` | Remove owned records and affected edges |
+| Preview any of the above | `load --dry-run` or `import --dry-run` | Report created/updated counts and every conflict; write nothing |
+| Remove specific nodes | `delete --node LABEL:ID [--apply]` | Remove nodes and incident edges; previews without `--apply` |
+| Clean stale ingester mentions | `prune [--apply]` | Drop mention edges the current ingester would not create, then edgeless `WebResource`/`EnvironmentVariable` nodes |
 
 Replacement, source refresh, and retirement discard evidence. Use them only when that scope is authorized. A request to import or add material authorizes the normal merge. A source refresh can remove links from other findings to retired evidence, while leaving those findings present. Recheck their support after refreshing. See [operations](references/operations.md) for ownership rules and recovery.
 
@@ -71,7 +102,10 @@ Replacement, source refresh, and retirement discard evidence. Use them only when
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" path project --from-label Service --from-id server \
   --to-label Service --to-id database --rels DEPENDS_ON
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" query project --sparql 'SELECT ?id WHERE { ?x a kg:ConfigKey ; kg:id ?id }'
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" find project --text 'timeout' --label ConfigKey
 ```
+
+`search` ranks chunk text and also returns up to `--nodes` (default 5) matching non-chunk nodes: lessons, findings, domain entities. `find` ranks nodes only, by label, ID, and string properties; labels the ingester makes (`WebResource`, `EnvironmentVariable`, `Document`, ...) are skipped unless named with `--label`. `show` on an unknown node fails and suggests close IDs. Add `--compact` to `search` for short evidence when context is tight.
 
 Search retrieves candidates. Read the decisive source text before answering, then use graph relations for context and cross-source reasoning. Cite the path or URL, revision, and original locator. Distinguish extracted facts, hypotheses, contradictions, and unknowns. For media-derived text, identify the extractor and original page, region, slide, or timestamp. Follow [references/verification.md](references/verification.md).
 
@@ -106,7 +140,9 @@ A `.graph-skill-db` is a ZIP container holding `manifest.json`, `nodes.jsonl`, `
 
 Blobs travel by default once a `--raw-root` is given; `--no-blobs` keeps the export record-only. Files are matched by digest, not by path, so a file edited since ingest is reported as `changed` and left out rather than passed off as the original evidence. Missing files are reported the same way and do not abort the export. Import writes `raw-store/ab/abcdef…`; without `--blob-dir` the blobs stay in the package.
 
-**Artifacts over 100 MiB are never packed silently.** They come back as `oversized` in the export report. Ask the user whether to include them before rerunning with `--include-large`, and say what it costs: package size, transfer time, and memory, since one blob is held whole at a time. Adjust the threshold with `--large-bytes`.
+**Artifacts over 100 MiB are never packed silently.** They come back as `oversized` in the export report. Ask the user whether to include them before rerunning with `--include-large`, and say what it costs: package size, transfer time, and disk space. Blobs are streamed, so memory stays bounded. Adjust the threshold with `--large-bytes`.
+
+Import verifies every blob before any record changes and keeps the bytes in `KG_HOME/blobs/<graph>/`, so the next export carries them without `--raw-root`. Export reports artifacts whose bytes are nowhere available as `missing`. Import and export print a compact report; add `--verbose` for the full manifest and every path.
 
 Inspect the validated manifest and summarize incoming sources/counts. Then merge into the existing graph, or create the named graph if none exists. Keep adding knowledge after import and export the accumulated result for handover. Reimporting unchanged records does not duplicate them.
 

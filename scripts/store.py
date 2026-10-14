@@ -210,15 +210,19 @@ def resolve_blobs(
     roots,
     large_bytes: int = LARGE_BLOB_BYTES,
     include_large: bool = False,
+    stores=(),
 ) -> dict:
     """Locate the raw files behind Artifact records under the given roots.
 
     Matching is content addressed: a candidate path only counts when its
     sha256 equals the digest recorded at ingest, so a file edited since then
     is reported rather than silently exported as the original evidence.
-    Artifacts larger than large_bytes are deferred until explicitly included.
+    Content-addressed stores (a graph's own blob store, an import --blob-dir)
+    are consulted first by digest. Artifacts larger than large_bytes are
+    deferred until explicitly included.
     """
     roots = [Path(root) for root in roots]
+    stores = [Path(store) for store in stores]
     blobs: dict[str, Path] = {}
     missing, changed, oversized = [], [], []
     for node in nodes:
@@ -231,7 +235,18 @@ def resolve_blobs(
         if not isinstance(relative, str) or not relative or digest in blobs:
             continue
         state, resolved = "missing", None
-        for root in roots:
+        for store in stores:
+            candidate = store / digest[:2] / digest
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            size = candidate.stat().st_size
+            if size > large_bytes and not include_large:
+                state, resolved = "oversized", size
+                break
+            if stream_sha256(candidate) == digest:
+                state, resolved = "found", candidate
+                break
+        for root in roots if state == "missing" else ():
             for candidate in _blob_candidates(relative, root):
                 if not candidate.is_file() or candidate.is_symlink():
                     continue
@@ -267,40 +282,81 @@ def skipped_blobs(manifest: dict) -> dict:
     return {"extracted": 0, "bytes": 0, "available": len(available)}
 
 
+def _copy_verified(stream, target_file, digest: str, block: int = 1 << 20) -> int:
+    """Copy stream to target_file while hashing; raise if the digest differs."""
+    hasher = hashlib.sha256()
+    size = 0
+    for piece in iter(lambda: stream.read(block), b""):
+        hasher.update(piece)
+        target_file.write(piece)
+        size += len(piece)
+    if hasher.hexdigest() != digest:
+        raise GraphValidationError(f"blobs/{digest}: blob checksum mismatch")
+    return size
+
+
 def extract_blobs(package: str | Path, blob_dir: str | Path) -> dict:
     """Unpack the package's object store into a sharded content-addressed tree.
 
     Every member is verified against its own name before it lands on disk, so a
     tampered or truncated archive cannot install bytes under a trusted digest.
     Names come from the digest, never from the archive, so no member can escape
-    the target directory.
+    the target directory. Members are streamed, so one large blob never has to
+    fit in memory. Re-extracting is idempotent: `extracted` counts every blob
+    now in the tree, `present` those that were already there before.
     """
     blob_dir = Path(blob_dir)
-    written, total = 0, 0
+    written, total, present = 0, 0, 0
     with zipfile.ZipFile(package) as archive:
         names = [n for n in archive.namelist() if n.startswith(BLOB_PREFIX)]
         for name in sorted(names):
             digest = name[len(BLOB_PREFIX) :]
             if not BLOB_NAME.match(digest):
                 raise GraphValidationError(f"{name}: not a sha256 blob name")
-            data = archive.read(name)
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise GraphValidationError(f"{name}: blob checksum mismatch")
             target = blob_dir / digest[:2] / digest
-            if target.exists() and target.read_bytes() == data:
-                total += len(data)
-                written += 1
-                continue
+            present += target.is_file()
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=digest + ".", dir=target.parent)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            try:
+                with os.fdopen(fd, "wb") as out, archive.open(name) as stream:
+                    total += _copy_verified(stream, out, digest)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
             written += 1
-            total += len(data)
-    return {"extracted": written, "bytes": total, "dir": str(blob_dir)}
+    return {
+        "extracted": written,
+        "bytes": total,
+        "present": present,
+        "dir": str(blob_dir),
+    }
+
+
+def _short(value, width: int = 80) -> str:
+    text = canonical(value)
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def conflict_message(conflicts, shown: int = 20) -> str:
+    """One readable error for every conflicting field in a rejected batch."""
+    lines = [
+        (
+            f"{len(conflicts)} property conflict{'s' if len(conflicts) != 1 else ''}; "
+            "nothing was written. Use versioned IDs or separate assertion nodes, or "
+            "explicitly choose on_conflict='incoming' for an intended correction:"
+        )
+    ]
+    for kind, key, prop, current, incoming in conflicts[:shown]:
+        lines.append(
+            f"  {kind} {key} field {prop!r}: stored {_short(current)}, "
+            f"incoming {_short(incoming)}"
+        )
+    if len(conflicts) > shown:
+        lines.append(f"  ... and {len(conflicts) - shown} more")
+    return "\n".join(lines)
 
 
 def stream_sha256(path: Path, block: int = 1 << 20) -> str:
@@ -557,6 +613,139 @@ def tokenize(text: str) -> list[str]:
     return terms
 
 
+# Labels the bundled ingester creates. They are plentiful and mostly lexical,
+# so node search leaves them out unless a caller asks for them by name.
+INGEST_LABELS = frozenset(
+    {"Source", "Document", "Artifact", "Chunk", "WebResource", "EnvironmentVariable"}
+)
+# Labels for knowledge that should outlive a session: what went wrong, what the
+# user wants, what is still open. `brief` lists these first.
+MEMORY_LABELS = (
+    "Lesson",
+    "Convention",
+    "Preference",
+    "Decision",
+    "Pitfall",
+    "SkillIssue",
+    "OpenQuestion",
+    "Finding",
+    "Todo",
+)
+SUMMARY_PROPS = (
+    "statement",
+    "title",
+    "summary",
+    "problem",
+    "question",
+    "detail",
+    "description",
+    "subject",
+    "note",
+    "name",
+)
+DATE_PROPS = ("observed", "observed_at", "found", "date", "updated", "created")
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+NODE_TEXT_LIMIT = 4000
+
+
+def _strings(value):
+    if isinstance(value, str):
+        yield value[:NODE_TEXT_LIMIT]
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+
+
+def node_summary(props: dict, width: int = 200) -> str:
+    for name in SUMMARY_PROPS:
+        value = props.get(name)
+        if isinstance(value, str) and value.strip():
+            text = " ".join(value.split())
+            return text if len(text) <= width else text[: width - 3] + "..."
+    return ""
+
+
+def node_date(props: dict) -> str:
+    for name in DATE_PROPS:
+        value = props.get(name)
+        if isinstance(value, str) and DATE.match(value):
+            return value
+    # Session sources are usually dated ("session-2026-09-24"); that date is
+    # the best ordering hint for an undated note.
+    for name in ("source", "repository"):
+        found = re.search(r"\d{4}-\d{2}-\d{2}", str(props.get(name) or ""))
+        if found:
+            return found.group(0)
+    return ""
+
+
+def slug(text: str, words: int = 8) -> str:
+    parts = re.findall(r"[a-z0-9]+", text.casefold())
+    return "-".join(parts[:words]) or "note"
+
+
+def parse_ref(ref: str) -> tuple[str, str]:
+    label, sep, identifier = (ref or "").partition(":")
+    if not sep or not identifier or not SAFE_NAME.match(label):
+        raise GraphValidationError(f"reference {ref!r} must be LABEL:ID")
+    return label, identifier
+
+
+def note_records(
+    label: str,
+    text: str,
+    identifier: str | None = None,
+    source: str | None = None,
+    props: dict | None = None,
+    supported_by=(),
+    about=(),
+    links=(),
+    today: str | None = None,
+):
+    """Neutral records for one piece of session knowledge plus its links.
+
+    `links` holds (REL, "LABEL:ID") pairs for any other relation.
+    """
+    _check_name("label", label)
+    if not isinstance(text, str) or not text.strip():
+        raise GraphValidationError("a note needs non-empty text")
+    today = today or datetime.now(timezone.utc).date().isoformat()
+    identifier = identifier or f"{label.lower()}:{slug(text)}"
+    node_props = {
+        "statement": text.strip(),
+        "observed": today,
+        "source": source or f"session-{today}",
+        **(props or {}),
+    }
+    node = {"label": label, "id": identifier, "props": node_props}
+    pairs = (
+        [("SUPPORTED_BY", ref) for ref in supported_by]
+        + [("ABOUT", ref) for ref in about]
+        + list(links)
+    )
+    edges = []
+    for rel, ref in pairs:
+        _check_name("relation", rel)
+        dst_label, dst = parse_ref(ref)
+        edges.append(
+            {
+                "rel": rel,
+                "src_label": label,
+                "src": identifier,
+                "dst_label": dst_label,
+                "dst": dst,
+            }
+        )
+    return [node], edges
+
+
+class _DryRun(Exception):
+    """Raised inside a transaction to roll a preview back."""
+
+
 class KG:
     def __init__(self, name: str, ns: str | None = None, create: bool = False):
         if not isinstance(name, str) or not re.fullmatch(
@@ -567,6 +756,10 @@ class KG:
         self.home = graph_home()
         self.graph_path = self.home / "rdf" / f"{name}.oxi"
         self.content_path = self.home / "content" / f"{name}.sqlite3"
+        # Raw artifact bytes that arrived in an imported package. Keeping them
+        # beside the records is what lets the next export carry them on; without
+        # it, one import/export round trip silently dropped every blob.
+        self.blob_path = self.home / "blobs" / name
         self.file = self.graph_path
         rdf_existed = self.graph_path.exists()
         if not create and not (self.graph_path.exists() or self.content_path.exists()):
@@ -585,6 +778,7 @@ class KG:
                     kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                     PRIMARY KEY(kind,key));
             """)
+            self._prepare_node_index()
             saved = self._meta("namespace")
             inferred = set()
             if not saved:
@@ -672,9 +866,81 @@ class KG:
         return canonical([record[field] for field in fields])
 
     def _put(self, kind, record):
+        key = self._key(kind, record)
         self.content.execute(
             "INSERT OR REPLACE INTO records VALUES (?,?,?)",
-            (kind, self._key(kind, record), canonical(record)),
+            (kind, key, canonical(record)),
+        )
+        if kind == "node":
+            self._index_node(key, record)
+
+    def _unput(self, kind, record):
+        key = self._key(kind, record)
+        self.content.execute("DELETE FROM records WHERE kind=? AND key=?", (kind, key))
+        if kind == "node":
+            self.content.execute("DELETE FROM node_index WHERE key=?", (key,))
+            if record["label"] == "Chunk":
+                self.content.execute(
+                    "DELETE FROM chunks WHERE node_iri=?",
+                    (self.node_iri("Chunk", record["id"]).value,),
+                )
+
+    def _prepare_node_index(self) -> None:
+        """Full-text index over non-Chunk node properties.
+
+        Chunk text answers "what do the sources say"; lessons, conventions and
+        findings live in node properties, and without this index a search could
+        never surface them.
+        """
+        existed = self.content.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='node_index'"
+        ).fetchone()
+        self.content.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS node_index (
+                rowid INTEGER PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS node_index_label ON node_index(label);
+            CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5(
+                name, text, content='node_index', content_rowid='rowid',
+                tokenize='unicode61'
+            );
+            CREATE TRIGGER IF NOT EXISTS node_index_ai AFTER INSERT ON node_index BEGIN
+                INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS node_index_ad AFTER DELETE ON node_index BEGIN
+                INSERT INTO node_fts(node_fts, rowid, name, text)
+                    VALUES ('delete', old.rowid, old.name, old.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS node_index_au AFTER UPDATE ON node_index BEGIN
+                INSERT INTO node_fts(node_fts, rowid, name, text)
+                    VALUES ('delete', old.rowid, old.name, old.text);
+                INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
+            END;
+            """
+        )
+        if not existed:
+            with self.content:
+                for row in self.content.execute(
+                    "SELECT key, value FROM records WHERE kind='node'"
+                ).fetchall():
+                    self._index_node(row[0], strict_json(row[1]))
+        self.content.commit()
+
+    def _index_node(self, key, record):
+        self.content.execute("DELETE FROM node_index WHERE key=?", (key,))
+        if record["label"] == "Chunk":
+            return
+        name = re.sub(r"[^\w]+", " ", f"{record['label']} {record['id']}").strip()
+        text = "\n".join(_strings(record.get("props") or {}))
+        self.content.execute(
+            "INSERT INTO node_index(key, label, id, name, text) VALUES (?,?,?,?,?)",
+            (key, record["label"], record["id"], name, text),
         )
 
     def _record(self, kind, key):
@@ -906,14 +1172,7 @@ class KG:
             ):
                 removed.add((node["label"], node["id"]))
                 removed_records.append(("node", node))
-                self.content.execute(
-                    "DELETE FROM records WHERE kind='node' AND key=?",
-                    (self._key("node", node),),
-                )
-                self.content.execute(
-                    "DELETE FROM chunks WHERE node_iri=?",
-                    (self.node_iri(node["label"], node["id"]).value,),
-                )
+                self._unput("node", node)
         edges_removed = facts_removed = 0
         for edge in list(self._records("edge")):
             if (
@@ -921,10 +1180,7 @@ class KG:
                 or (edge["dst_label"], edge["dst"]) in removed
                 or self._owners(edge) == {source}
             ):
-                self.content.execute(
-                    "DELETE FROM records WHERE kind='edge' AND key=?",
-                    (self._key("edge", edge),),
-                )
+                self._unput("edge", edge)
                 removed_records.append(("edge", edge))
                 edges_removed += 1
                 facts_removed += bool(edge.get("props"))
@@ -957,11 +1213,15 @@ class KG:
         replace: bool = False,
         source: str | None = None,
         on_conflict: str = "error",
+        dry_run: bool = False,
     ) -> dict:
         """Commit a complete additive batch; conflicting fields require an explicit policy.
 
         Source refresh and replacement are explicit destructive operations. The
         records and FTS changes commit together; RDF is a recoverable derived index.
+        With dry_run, the whole batch runs inside the transaction and is rolled
+        back: the report says what would be created or updated and lists every
+        conflict instead of raising.
         """
         if on_conflict not in {"error", "incoming"}:
             raise GraphValidationError("on_conflict must be error or incoming")
@@ -995,8 +1255,47 @@ class KG:
                     raise GraphValidationError(
                         "source refresh batch contains another Source"
                     )
-        written = 0
-        changed = 0
+        base_revision = self._meta("revision")
+        try:
+            report = self._load_transaction(
+                nodes, edges, replace, source, on_conflict, dry_run
+            )
+        except _DryRun as preview:
+            return preview.args[0]
+        (
+            written,
+            changed,
+            created,
+            updated,
+            removed_records,
+            changed_records,
+            validation,
+        ) = report
+        if replace:
+            # Everything is new, so a bulk rebuild beats a quad-by-quad delta.
+            self._ensure_rdf()
+        elif changed:
+            self._apply_rdf_delta(base_revision, removed_records, changed_records)
+        return {
+            **validation,
+            "mode": "replace"
+            if replace
+            else "replace_source"
+            if source is not None
+            else "merge",
+            "created": created,
+            "updated": updated,
+            "triples": len(self.store),
+            "chunks_written": written,
+            "chunks_total": self.content.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0],
+            "graph_store": str(self.graph_path),
+            "content_store": str(self.content_path),
+        }
+
+    def _load_transaction(self, nodes, edges, replace, source, on_conflict, dry_run):
+        written = changed = created = updated = 0
         removed_records = []
         changed_records = []
         base_revision = self._meta("revision")
@@ -1007,6 +1306,7 @@ class KG:
                 ).fetchone()[0]
                 self.content.execute("DELETE FROM records")
                 self.content.execute("DELETE FROM chunks")
+                self.content.execute("DELETE FROM node_index")
             elif source is not None:
                 dropped = self._drop_source(source)
                 removed_records = dropped["removed_records"]
@@ -1014,6 +1314,7 @@ class KG:
             validation = validate_graph(
                 nodes, edges, resolve=self.exists if not replace else None
             )
+            conflicts = []
             for kind, records in (("node", nodes), ("edge", edges)):
                 for incoming in records:
                     incoming = strict_json(canonical(incoming))
@@ -1035,42 +1336,61 @@ class KG:
                             and canonical(props[prop]) != canonical(value)
                             and on_conflict == "error"
                         ):
-                            raise GraphValidationError(
-                                f"property conflict at {kind} {key}, field {prop!r}; use a versioned ID or explicitly choose on_conflict='incoming'"
-                            )
+                            # Collect every conflict before aborting: fixing a
+                            # large merge one field per attempt is hopeless.
+                            conflicts.append((kind, key, prop, props[prop], value))
+                            continue
                         props[prop] = value
                     if props or kind == "node" or "props" in incoming:
                         incoming["props"] = props
                     if previous and canonical(previous) == canonical(incoming):
                         continue
+                    created += previous is None
+                    updated += previous is not None
                     self._put(kind, incoming)
                     changed_records.append((kind, previous, incoming))
                     changed += 1
                     if kind == "node" and incoming["label"] == "Chunk":
                         self._write_chunk(incoming)
                         written += 1
+            if dry_run:
+                raise _DryRun(
+                    {
+                        **validation,
+                        "dry_run": True,
+                        "mode": "replace"
+                        if replace
+                        else "replace_source"
+                        if source is not None
+                        else "merge",
+                        "created": created,
+                        "updated": updated,
+                        "removed": len(removed_records),
+                        "conflicts": [
+                            {
+                                "kind": kind,
+                                "key": key,
+                                "field": prop,
+                                "stored": current,
+                                "incoming": value,
+                            }
+                            for kind, key, prop, current, value in conflicts
+                        ],
+                    }
+                )
+            if conflicts:
+                raise GraphValidationError(conflict_message(conflicts))
             if changed:
                 self._set_meta("revision", int(base_revision) + 1)
-        if replace:
-            # Everything is new, so a bulk rebuild beats a quad-by-quad delta.
-            self._ensure_rdf()
-        elif changed:
-            self._apply_rdf_delta(base_revision, removed_records, changed_records)
-        return {
-            **validation,
-            "mode": "replace"
-            if replace
-            else "replace_source"
-            if source is not None
-            else "merge",
-            "triples": len(self.store),
-            "chunks_written": written,
-            "chunks_total": self.content.execute(
-                "SELECT COUNT(*) FROM chunks"
-            ).fetchone()[0],
-            "graph_store": str(self.graph_path),
-            "content_store": str(self.content_path),
-        }
+        return (
+            written,
+            changed,
+            created,
+            updated,
+            removed_records,
+            changed_records,
+            validation,
+        )
 
     def _write_chunk(self, node):
         props = node.get("props", {})
@@ -1221,13 +1541,19 @@ class KG:
         nodes, edges = self.export_records()
         found = (
             resolve_blobs(
-                nodes, raw_roots, large_bytes=large_bytes, include_large=include_large
+                nodes,
+                raw_roots,
+                large_bytes=large_bytes,
+                include_large=include_large,
+                stores=[self.blob_path],
             )
-            if blobs and raw_roots
+            if blobs
             else {"blobs": {}, "missing": [], "changed": [], "oversized": []}
         )
+        # Sizes only: bytes are streamed into the archive one blob at a time.
         stored = {
-            digest: source.read_bytes() for digest, source in found["blobs"].items()
+            digest: source.stat().st_size
+            for digest, source in sorted(found["blobs"].items())
         }
         payloads = {
             name: "".join(canonical(r) + "\n" for r in records).encode("utf-8")
@@ -1250,13 +1576,10 @@ class KG:
                 name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                 for name, data in payloads.items()
             },
-            "blobs": {digest: len(data) for digest, data in sorted(stored.items())},
+            "blobs": dict(stored),
         }
         payloads["manifest.json"] = canonical(manifest).encode("utf-8")
-        if (
-            sum(map(len, payloads.values())) + sum(map(len, stored.values()))
-            > max_bytes
-        ):
+        if sum(map(len, payloads.values())) + sum(stored.values()) > max_bytes:
             raise GraphValidationError(
                 "package exceeds max_bytes; shard the corpus, drop blobs with "
                 "--no-blobs, or explicitly raise the limit"
@@ -1269,8 +1592,16 @@ class KG:
                 ) as archive:
                     for name, data in payloads.items():
                         archive.writestr(name, data)
-                    for digest, data in sorted(stored.items()):
-                        archive.writestr(BLOB_PREFIX + digest, data)
+                    for digest, source in sorted(found["blobs"].items()):
+                        with (
+                            source.open("rb") as raw,
+                            archive.open(
+                                BLOB_PREFIX + digest, "w", force_zip64=True
+                            ) as member,
+                        ):
+                            # Re-hash while copying: a file edited after it was
+                            # resolved must not be packed under the old digest.
+                            _copy_verified(raw, member, digest)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
@@ -1283,7 +1614,7 @@ class KG:
             "bytes": path.stat().st_size,
             "blobs": {
                 "stored": len(stored),
-                "bytes": sum(map(len, stored.values())),
+                "bytes": sum(stored.values()),
                 "missing": found["missing"],
                 "changed": found["changed"],
                 "oversized": found["oversized"],
@@ -1428,9 +1759,25 @@ class KG:
         on_conflict: str = "error",
         max_bytes: int = MAX_PACKAGE_BYTES,
         blob_dir: str | Path | None = None,
+        dry_run: bool = False,
     ) -> dict:
         manifest, nodes, edges = self.read_package(path, max_bytes=max_bytes)
+        if dry_run:
+            return {
+                **self.load(
+                    nodes, edges, replace=replace, on_conflict=on_conflict, dry_run=True
+                ),
+                "package": str(path),
+                "manifest": manifest,
+            }
+        # Blobs are verified and kept before any record changes: a package whose
+        # bytes do not match their digests is rejected as a whole, and the bytes
+        # that do arrive stay with the graph for its next export.
+        kept = extract_blobs(path, self.blob_path)
         result = self.load(nodes, edges, replace=replace, on_conflict=on_conflict)
+        blobs = extract_blobs(path, blob_dir) if blob_dir else skipped_blobs(manifest)
+        blobs["kept"] = kept["extracted"]
+        blobs["store"] = kept["dir"]
         return {
             **result,
             "package": str(path),
@@ -1438,9 +1785,7 @@ class KG:
             "integrity": "sha256"
             if manifest["version"] >= 2
             else "legacy-no-checksums",
-            "blobs": extract_blobs(path, blob_dir)
-            if blob_dir
-            else skipped_blobs(manifest),
+            "blobs": blobs,
         }
 
     # -------------------------------------------------------------------- read
@@ -1599,8 +1944,13 @@ class KG:
         min_score: float = MIN_SCORE,
         source: str | None = None,
         candidate_limit: int = 20000,
+        nodes: int = 5,
     ) -> dict:
-        """Rank lexical evidence; an unmatched term is not proof of factual absence."""
+        """Rank lexical evidence; an unmatched term is not proof of factual absence.
+
+        Up to `nodes` matching knowledge nodes (lessons, findings, domain nodes)
+        are returned beside the chunk results; 0 turns that off.
+        """
         if (
             scope not in {"file", "chunk"}
             or limit < 0
@@ -1612,7 +1962,12 @@ class KG:
             )
         terms = [t for t in dict.fromkeys((t or "").strip() for t in terms or []) if t]
         if not terms:
-            return {"terms": [], "unmatched": [], "results": []}
+            return {"terms": [], "unmatched": [], "results": [], "nodes": []}
+        node_hits = (
+            self.find(terms, limit=nodes, require_all=require_all, source=source)
+            if nodes > 0
+            else []
+        )
 
         text_df = {
             term: self.document_frequency(term, "text", source) for term in terms
@@ -1625,7 +1980,12 @@ class KG:
         matched = [term for term in terms if text_df[term] or location_df[term]]
         unmatched = [term for term in terms if not (text_df[term] or location_df[term])]
         if not matched or (require_all and unmatched):
-            return {"terms": terms, "unmatched": unmatched, "results": []}
+            return {
+                "terms": terms,
+                "unmatched": unmatched,
+                "results": [],
+                "nodes": node_hits,
+            }
 
         total_chunks = (
             self.content.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 1
@@ -1736,7 +2096,206 @@ class KG:
             "results": results,
             "candidate_limit": candidate_limit,
             "capped_terms": capped,
+            "nodes": node_hits,
         }
+
+    def find(
+        self,
+        query,
+        labels=None,
+        limit: int = 10,
+        require_all: bool = False,
+        source: str | None = None,
+        width: int = 300,
+    ) -> list[dict]:
+        """Rank non-Chunk nodes by their label, ID and string properties.
+
+        `query` is a question (tokenized) or a list of exact phrases. Labels the
+        ingester makes are skipped unless named in `labels`, so lessons and
+        findings are not drowned by thousands of URL and variable mentions.
+        """
+        terms = tokenize(query) if isinstance(query, str) else list(query or [])
+        terms = [t for t in dict.fromkeys(t.strip() for t in terms if t) if t]
+        if not terms or limit <= 0:
+            return []
+        match = (" AND " if require_all else " OR ").join(
+            self._fts_phrase(term) for term in terms
+        )
+        predicates, params = ["node_fts MATCH ?"], [match]
+        if labels:
+            for label in labels:
+                _check_name("label", label)
+            predicates.append(f"n.label IN ({','.join('?' * len(labels))})")
+            params.extend(labels)
+        else:
+            predicates.append(f"n.label NOT IN ({','.join('?' * len(INGEST_LABELS))})")
+            params.extend(sorted(INGEST_LABELS))
+        rows = self.content.execute(
+            "SELECT n.key, n.label, n.id, n.name, n.text, "
+            "bm25(node_fts, 2.0, 1.0) AS rank FROM node_fts "
+            "JOIN node_index n ON n.rowid = node_fts.rowid "
+            f"WHERE {' AND '.join(predicates)} ORDER BY rank, n.key LIMIT ?",
+            [*params, max(limit * 5, 50)],
+        ).fetchall()
+        hits = []
+        for row in rows:
+            record = self._record("node", [row["label"], row["id"]]) or {}
+            props = record.get("props") or {}
+            if source is not None and source not in self._owners(record):
+                continue
+            haystack = f"{row['name']}\n{row['text']}".casefold()
+            matched = [t for t in terms if t.casefold() in haystack]
+            hits.append(
+                {
+                    "label": row["label"],
+                    "id": row["id"],
+                    "score": round(len(matched) / len(terms), 3),
+                    "matched_terms": matched,
+                    "props": {
+                        key: (
+                            value
+                            if not isinstance(value, str) or len(value) <= width
+                            else value[: width - 3] + "..."
+                        )
+                        for key, value in props.items()
+                    },
+                    "_rank": row["rank"],
+                }
+            )
+        # Coverage first, then BM25: a node naming every term beats one that
+        # repeats a single term many times.
+        hits.sort(
+            key=lambda hit: (-hit["score"], hit["_rank"], hit["label"], hit["id"])
+        )
+        for hit in hits:
+            del hit["_rank"]
+        return hits[:limit]
+
+    def brief(self, labels=None, per_label: int = 10, width: int = 200) -> dict:
+        """Session-start digest: memory nodes newest first, other labels counted."""
+        counts = Counter(
+            {
+                row[0]: row[1]
+                for row in self.content.execute(
+                    "SELECT json_extract(value, '$.label'), COUNT(*) FROM records "
+                    "WHERE kind='node' GROUP BY 1"
+                )
+            }
+        )
+        wanted = list(labels) if labels else [l for l in MEMORY_LABELS if counts[l]]
+        memory = {}
+        for label in wanted:
+            _check_name("label", label)
+            items = []
+            for row in self.content.execute(
+                "SELECT value FROM records WHERE kind='node' "
+                "AND json_extract(value, '$.label') = ?",
+                (label,),
+            ):
+                record = strict_json(row[0])
+                props = record.get("props") or {}
+                items.append(
+                    {
+                        "id": record["id"],
+                        "date": node_date(props),
+                        "summary": node_summary(props, width),
+                        "source": props.get("source") or props.get("repository") or "",
+                    }
+                )
+            items.sort(key=lambda item: (item["date"], item["id"]), reverse=True)
+            memory[label] = {"count": len(items), "items": items[:per_label]}
+        return {
+            "graph": self.name,
+            "nodes": sum(counts.values()),
+            "sources": len(self.sources()),
+            "memory": memory,
+            "other_labels": {
+                label: count
+                for label, count in sorted(counts.items())
+                if label not in memory
+            },
+        }
+
+    def suggest(self, label: str, identifier: str, limit: int = 5) -> list[str]:
+        """Nearby node references for a lookup that found nothing."""
+        import difflib
+
+        rows = self.content.execute(
+            "SELECT label, id FROM node_index WHERE label = ? OR id = ?",
+            (label, identifier),
+        ).fetchall()
+        exact = [f"{row[0]}:{row[1]}" for row in rows if row[1] == identifier]
+        same = [row[1] for row in rows if row[0] == label]
+        close = [i for i in same if identifier.casefold() in i.casefold()]
+        close += difflib.get_close_matches(identifier, same, n=limit, cutoff=0.6)
+        return list(dict.fromkeys(exact + [f"{label}:{i}" for i in sorted(close)]))[
+            :limit
+        ]
+
+    # ------------------------------------------------------------------ remove
+    def orphans(self, labels) -> list[tuple[str, str]]:
+        """Nodes of the given labels with no incident edge at all."""
+        for label in labels:
+            _check_name("label", label)
+        linked = set()
+        for row in self.content.execute("SELECT value FROM records WHERE kind='edge'"):
+            edge = strict_json(row[0])
+            linked.add((edge["src_label"], edge["src"]))
+            linked.add((edge["dst_label"], edge["dst"]))
+        found = []
+        for label in labels:
+            for row in self.content.execute(
+                "SELECT json_extract(value, '$.id') FROM records WHERE kind='node' "
+                "AND json_extract(value, '$.label') = ? ORDER BY key",
+                (label,),
+            ):
+                if (label, row[0]) not in linked:
+                    found.append((label, row[0]))
+        return found
+
+    def delete(self, nodes=(), edges=(), dry_run: bool = False) -> dict:
+        """Explicitly remove nodes (with every incident edge) and edges.
+
+        `nodes` holds (label, id) pairs, `edges` neutral edge identities. Unknown
+        references are reported, not fatal. Destructive: preview with dry_run.
+        """
+        targets = {(label, identifier) for label, identifier in nodes}
+        edge_keys = {self._key("edge", edge) for edge in edges}
+        missing = sorted(
+            f"{label}:{identifier}"
+            for label, identifier in targets
+            if not self.exists(label, identifier)
+        )
+        removed = []
+        for label, identifier in sorted(targets):
+            record = self._record("node", [label, identifier])
+            if record:
+                removed.append(("node", record))
+        for row in self.content.execute(
+            "SELECT key, value FROM records WHERE kind='edge'"
+        ).fetchall():
+            edge = strict_json(row[1])
+            if (
+                row[0] in edge_keys
+                or (edge["src_label"], edge["src"]) in targets
+                or (edge["dst_label"], edge["dst"]) in targets
+            ):
+                removed.append(("edge", edge))
+        report = {
+            "dry_run": dry_run,
+            "nodes_removed": sum(kind == "node" for kind, _ in removed),
+            "edges_removed": sum(kind == "edge" for kind, _ in removed),
+            "missing": missing,
+        }
+        if dry_run or not removed:
+            return report
+        base = self._meta("revision")
+        with self.content:
+            for kind, record in removed:
+                self._unput(kind, record)
+            self._set_meta("revision", int(base) + 1)
+        self._apply_rdf_delta(base, removed, [])
+        return report
 
     def search_keywords(
         self, keywords, limit=10, scope="file", require_all=True, source=None
@@ -1753,6 +2312,21 @@ class KG:
         )["results"]
 
     # ------------------------------------------------------------------- stats
+    def sources(self) -> list[str]:
+        """Source names exactly as a package manifest lists them: Source node
+        IDs plus every node's string `source`/`repository` owner tag."""
+        rows = self.content.execute(
+            """SELECT json_extract(value, '$.id') FROM records
+               WHERE kind='node' AND json_extract(value, '$.label') = 'Source'
+               UNION
+               SELECT json_extract(value, '$.props.source') FROM records
+               WHERE kind='node' AND json_type(value, '$.props.source') = 'text'
+               UNION
+               SELECT json_extract(value, '$.props.repository') FROM records
+               WHERE kind='node' AND json_type(value, '$.props.repository') = 'text'"""
+        )
+        return sorted({row[0] for row in rows if row[0]})
+
     def stats(self) -> dict:
         self._ensure_rdf()
         labels = Counter()
@@ -1770,16 +2344,7 @@ class KG:
             ):
                 rels[rel] += 1
         chunks = self.content.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        sources = sorted(
-            {
-                row[0]
-                for row in self.content.execute(
-                    "SELECT DISTINCT repository FROM chunks"
-                )
-                if row[0]
-            }
-            | set(self.q("SELECT ?id WHERE { ?s a kg:Source ; kg:id ?id }"))
-        )
+        sources = self.sources()
         size = sum(p.stat().st_size for p in self.graph_path.rglob("*") if p.is_file())
         size += sum(
             p.stat().st_size

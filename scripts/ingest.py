@@ -84,9 +84,24 @@ SKIP_PREFIXES = (".venv", "venv", ".direnv", ".cache")
 
 def skipped_directory(name: str) -> bool:
     return name in SKIP_DIRECTORIES or name.startswith(SKIP_PREFIXES)
+
+
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$")
 ENVIRONMENT_VARIABLE = re.compile(r"\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b")
-URL = re.compile(r"https?://[^\s<>'\")\]]+")
+# Backticks, quotes and backslashes end a URL: they come from Markdown code spans,
+# JSON strings and escape sequences such as "\\n", never from the address itself.
+# Typographic quotes and guillemets end a URL too: prose written in editors that
+# "smarten" quotes wraps links in them, and the closing mark is never part of it.
+# Parentheses stay so balanced ones (Wikipedia-style paths) survive; unbalanced
+# closers and sentence punctuation are trimmed afterwards. CJK text puts no space
+# after its full stop or comma, so those end a URL outright.
+URL = re.compile(
+    r"https?://[^\s<>'\"`\\\[\]"
+    r"\u2018\u2019\u201c\u201d\u00ab\u00bb\u2039\u203a\u300c-\u300f"
+    r"\u3001\u3002\uff0c\uff1b\uff1a\uff01\uff1f]+"
+)
+URL_TRAILING = ".,;:!?*"
+URL_PAIRS = {")": "(", "}": "{"}
 
 
 @dataclass(frozen=True)
@@ -139,6 +154,26 @@ def stream_sha256(path: Path, block: int = 1 << 20) -> str:
         for chunk in iter(lambda: stream.read(block), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _trim_url(url: str) -> str:
+    while url:
+        last = url[-1]
+        unbalanced = last in URL_PAIRS and url.count(URL_PAIRS[last]) < url.count(last)
+        if last not in URL_TRAILING and not unbalanced:
+            break
+        url = url[:-1]
+    return url
+
+
+def url_mentions(text: str) -> list[str]:
+    """Distinct, sorted URLs in text, without surrounding punctuation or markup."""
+    found = set()
+    for raw in URL.findall(text):
+        url = _trim_url(raw)
+        if any(character.isalnum() for character in url_host(url)):
+            found.add(url)
+    return sorted(found)
 
 
 def url_host(url: str) -> str:
@@ -403,7 +438,7 @@ def build_graph(
                         variable,
                     )
             if links:
-                for url in sorted(set(URL.findall(chunk.text))):
+                for url in url_mentions(chunk.text):
                     builder.node("WebResource", url, url=url, host=url_host(url))
                     builder.edge("LINKS_TO", "Chunk", chunk_id, "WebResource", url)
     return builder.output()

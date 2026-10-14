@@ -7,7 +7,7 @@
 3. Node and relation counts match the source inventory wherever an exact count exists.
 4. Every sampled fact resolves to its recorded path and line range.
 5. Normal load/import preserves existing knowledge; explicit replacement removes retired evidence. Source refresh preserves other source-owned nodes and removes edges touching retired nodes.
-6. An export, a fresh import, and a re-export produce identical records.
+6. An export, a fresh import, and a re-export produce identical records and the same set of blobs.
 7. Empty results are checked against the actual labels, relations, and source coverage before being reported as absence.
 8. The question set spans simple retrieval, administration, cross-source, absence, aggregation, and programming questions.
 

@@ -161,3 +161,36 @@ def test_only_source_roots_merge_as_a_set_other_fields_still_conflict(
             graph.load([{**other, "props": {"roots": ["b"]}}], [])
         with pytest.raises(GraphValidationError, match="conflict"):
             graph.load([source(roots="not-a-list")], [])
+
+
+def test_stats_sources_match_package_sources(tmp_path, monkeypatch):
+    monkeypatch.setenv("KG_HOME", str(tmp_path))
+    nodes = [
+        {"label": "Source", "id": "docs", "props": {}},
+        {"label": "Lesson", "id": "l1", "props": {"source": "session-1"}},
+        {"label": "Repo", "id": "r", "props": {"repository": "upstream"}},
+    ]
+    with KG("owners", create=True) as graph:
+        graph.load(nodes, [])
+        package = graph.export_package(tmp_path / "p")
+        assert graph.stats()["sources"] == ["docs", "session-1", "upstream"]
+    manifest, _n, _e = KG.read_package(package["package"])
+    assert manifest["sources"] == ["docs", "session-1", "upstream"]
+
+
+def test_conflict_error_lists_every_conflicting_field(tmp_path, monkeypatch):
+    monkeypatch.setenv("KG_HOME", str(tmp_path))
+    with KG("conflicts", create=True) as graph:
+        graph.load([{"label": "T", "id": "a", "props": {"x": 1, "y": 1}}], [])
+        graph.load([{"label": "T", "id": "b", "props": {"z": 1}}], [])
+        with pytest.raises(GraphValidationError) as error:
+            graph.load(
+                [
+                    {"label": "T", "id": "a", "props": {"x": 2, "y": 2}},
+                    {"label": "T", "id": "b", "props": {"z": 2}},
+                ],
+                [],
+            )
+    message = str(error.value)
+    assert "'x'" in message and "'y'" in message and '"b"' in message
+    assert "3 property conflicts" in message

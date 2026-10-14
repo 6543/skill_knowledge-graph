@@ -166,3 +166,51 @@ def test_cli_export_import_carry_blobs(tmp_path, monkeypatch):
     assert imported["blobs"]["extracted"] == 1
     digest = node["props"]["sha256"]
     assert (tmp_path / "restored" / digest[:2] / digest).read_bytes() == b"cli payload"
+
+
+def test_blobs_survive_import_then_export_without_blob_dir(tmp_path, monkeypatch):
+    """Session hand-over: import, work, export again must not drop raw bytes."""
+    root = tmp_path / "raw"
+    node = raw(root, "shot.png", b"screenshot bytes")
+    digest = node["props"]["sha256"]
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    with KG("origin", create=True) as graph:
+        graph.load([node], [])
+        first = graph.export_package(tmp_path / "first", raw_roots=[root])
+    with KG("session", create=True) as graph:
+        graph.import_package(first["package"])
+        second = graph.export_package(tmp_path / "second")
+    assert second["blobs"]["stored"] == 1
+    manifest, _nodes, _edges = KG.read_package(second["package"])
+    assert manifest["blobs"] == {digest: len(b"screenshot bytes")}
+
+
+def test_export_reports_artifacts_without_bytes_even_without_roots(tmp_path, kg):
+    node = artifact("gone.bin", "0" * 64, 3)
+    kg.load([node], [])
+    report = kg.export_package(tmp_path / "p")
+    assert report["blobs"]["missing"] == ["gone.bin"]
+
+
+def test_tampered_blob_is_rejected_before_records_merge(tmp_path, monkeypatch):
+    import zipfile
+
+    root = tmp_path / "raw"
+    node = raw(root, "a.bin", b"payload")
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    with KG("origin", create=True) as graph:
+        graph.load([node], [])
+        package = Path(
+            graph.export_package(tmp_path / "p", raw_roots=[root])["package"]
+        )
+    tampered = tmp_path / "tampered.graph-skill-db"
+    with zipfile.ZipFile(package) as source, zipfile.ZipFile(tampered, "w") as target:
+        for entry in source.infolist():
+            data = source.read(entry.filename)
+            if entry.filename.startswith("blobs/"):
+                data = b"PAYLOAD"  # same length: only the digest can tell
+            target.writestr(entry.filename, data)
+    with KG("target", create=True) as graph:
+        with pytest.raises(GraphValidationError):
+            graph.import_package(tampered)
+        assert graph.stats()["nodes"] == 0

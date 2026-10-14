@@ -15,6 +15,7 @@ The graph is not a copy of the sources. It is the smallest structure that answer
 - [Domain starter models](#domain-starter-models) - papers, wiki, code, infrastructure, logs, media
 - [Write domain helpers](#write-domain-helpers) - and reuse extraction skills that already exist
 - [Growing a model](#growing-a-model) - changing a schema that already has data in it
+- [Session memory](#session-memory) - lessons and conventions that outlive a session
 - [Smells](#smells) - what a bad model looks like from the outside
 - [Worked example](#worked-example) - one question set turned into a model
 
@@ -184,6 +185,30 @@ Schemas change once a graph has data in it. Three moves cover almost everything:
 Keep the neutral JSONL inputs and portable exports. SQLite stores the authoritative records; RDF is derived. Recovery details are in operations.
 
 Before importing, inspect source metadata and identity conventions. Conflicting property values abort the merge by default, but unrelated entities with identical IDs and disjoint properties could still fuse. Qualify IDs and model explicit mappings; source-name checks alone cannot prove identity.
+
+## Session memory
+
+Knowledge that should change what a later session does gets its own node, with a label from this set so `brief` finds it without configuration:
+
+| Label | Holds | Key props |
+|---|---|---|
+| `Lesson` | What went wrong or worked, and what to do instead | `statement`, `observed` |
+| `Convention` | How this user or project wants things done | `statement` |
+| `Preference` | A standing user choice (tooling, format, identity) | `statement` |
+| `Decision` | A choice made, with its reason, so it is not re-litigated | `statement`, `reason` |
+| `Pitfall` | A trap in a tool or codebase and how to avoid it | `statement`, `symptom` |
+| `SkillIssue` | A defect in a skill, with a prompt that would repair it | `problem`, `repair_prompt` |
+| `OpenQuestion` | Something unresolved to check next time | `statement` |
+| `Finding` | A verified fact about the domain, with `status` | `statement`, `status` |
+| `Todo` | Follow-up work promised or left open | `statement`, `status` |
+
+- **One idea per node, stated as an instruction or a fact**, not as a story. "Pin plugin images by digest in root CI" beats "we talked about pinning".
+- **Link evidence** with `SUPPORTED_BY` to the chunk, commit, or document it rests on, and **link the subject** with `ABOUT` (a `Skill`, `Repository`, `Tool`, domain node). A lesson without evidence is a rumour on the next read.
+- **IDs are `label:slug`**, stable and readable (`lesson:verify-in-detached-worktree`). Do not put dates in IDs; the `observed` prop and the `session-<date>` source carry time.
+- **Supersede instead of rewriting** when a lesson turns out wrong: note the corrected one under a new ID and link `SUPERSEDES` to the old one, so the history of why stays queryable.
+- **Keep memory separate from evidence.** A session source such as `session-2026-09-30` owns its notes. `load --source` on a corpus never touches them, and `drop-source` on a session removes exactly that session's notes.
+
+`note` writes these records in one step; hand-written JSONL works the same way.
 
 ## Smells
 

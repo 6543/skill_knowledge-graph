@@ -2,7 +2,7 @@
 
 ## Durable storage and recovery
 
-`KG_HOME` contains `content/NAME.sqlite3` and `rdf/NAME.oxi`. SQLite is authoritative: neutral records, metadata, chunk bodies, and FTS indexes commit together with WAL and synchronous FULL. Oxigraph is a derived topology index. Never edit either store directly.
+`KG_HOME` contains `content/NAME.sqlite3`, `rdf/NAME.oxi`, and `blobs/NAME/` for imported raw artifact bytes. SQLite is authoritative: neutral records, metadata, chunk bodies, and FTS indexes commit together with WAL and synchronous FULL. Oxigraph is a derived topology index. Never edit either store directly.
 
 The code acquires Oxigraph's exclusive lock before opening SQLite. Use one `KG` instance per named graph, close it, and run CLI commands sequentially. Different graphs can be used independently. Python usage:
 
@@ -29,6 +29,8 @@ Default `load` and `import` merge. Properties omitted from an incoming node or e
 
 The ingester records `Source.roots` as the basename of each input. Pass `ingest.py --root-name NAME` to record `NAME` instead, for example to keep a stable name when the checkout directory is named differently. It requires exactly one input, because with several inputs each document path is prefixed by its own input name.
 
+A rejected batch lists every conflicting field, the first 20 in full. `load --dry-run` and `import --dry-run` run the whole batch inside the transaction and roll it back: the report gives `created`, `updated`, `removed`, and every conflict with stored and incoming values, and nothing is written (an import dry run also skips blob extraction). Use it before merging a package from another lineage.
+
 `load --replace` replaces the whole graph. `load --source NAME` refreshes that source and rejects batches tagged to other sources. Edge endpoints may resolve against surviving external nodes. `drop-source --source NAME` retires it. These operations are explicit and destructive.
 
 Ownership is deliberately narrow:
@@ -42,6 +44,18 @@ Ownership is deliberately narrow:
 Shared findings can therefore survive while losing support edges to retired evidence. Re-evaluate unsupported findings after refresh. This model is not a multi-owner assertion database: use separate assertion nodes and evidence links when several sources independently assert the same fact.
 
 The ingester gives documents/artifacts IDs including the raw content digest, and chunks IDs including document version, ordinal, and chunk digest. Additive re-ingest retains old versions. Source refresh intentionally retires them. Domain helpers must include equivalent version dimensions where needed.
+
+## Explicit removal and cleanup
+
+`delete --node LABEL:ID` (repeatable) removes those nodes, their chunk text, and every incident edge. `prune` removes `LINKS_TO` and `MENTIONS_ENV` edges from bundled-ingester chunks (`extractor` `plain-text@…` or `html-text@…`, no edge props) that the current ingester would no longer derive from the chunk text, then removes `WebResource` and `EnvironmentVariable` nodes left without any edge (`--orphan-label` changes that set). Domain edges and edges with props are never judged. Both preview by default and act only with `--apply`.
+
+Merging never deletes, so an older package brings back whatever a later cleanup removed, for example URL mentions from before a fix to the ingester. Run `prune` after such a merge. `prune` does not add mentions the fixed ingester would now create; re-ingest the source for that.
+
+## Node search
+
+Besides chunk text, SQLite keeps a full-text index over every non-Chunk node: label, ID, and all string values in its properties (each capped at 4,000 characters). Writes, source refresh, deletion, and replacement keep it in step; a graph written before the index existed builds it on first open. `find` and the `nodes` part of `search` rank it by term coverage, then BM25. Ingester labels are excluded unless requested, because they outnumber knowledge nodes by orders of magnitude.
+
+`brief` reads records directly. Its default labels are the memory labels in [modeling](modeling.md#session-memory); a node's date is the first ISO date among `observed`, `observed_at`, `found`, `date`, `updated`, `created`, else a date inside its `source` name.
 
 ## Package contract
 
@@ -83,9 +97,11 @@ Default total uncompressed limit: 512 MiB. Manifest limit: 1 MiB. Export/import/
 
 ### Raw artifact bytes
 
-Records only reference raw files, by relative path plus `sha256`. `export --raw-root DIR` collects those files into the package. Resolution is content addressed: a candidate under the root is accepted only if its digest still matches the record, so a file edited since ingest is reported as `changed` rather than shipped as the original evidence. Missing files are reported too; neither aborts the export. Artifacts above `--large-bytes` (100 MiB by default) are reported as `oversized` and left out. Ask the user before adding `--include-large`, and expect the package limit to bite. Export and extraction hold one blob in memory at a time, so a very large included artifact needs headroom.
+Records only reference raw files, by relative path plus `sha256`. `export --raw-root DIR` collects those files into the package. Resolution is content addressed: a candidate under the root is accepted only if its digest still matches the record, so a file edited since ingest is reported as `changed` rather than shipped as the original evidence. Missing files are reported too; neither aborts the export. Artifacts above `--large-bytes` (100 MiB by default) are reported as `oversized` and left out. Ask the user before adding `--include-large`, and expect the package limit to bite. Export and extraction stream blobs in 1 MiB pieces and re-hash while copying, so a file edited after it was resolved aborts the export instead of being packed under its old digest.
 
-`import --blob-dir DIR` unpacks the object store into `DIR/ab/abcdef…`, sharded by the first two digest characters, restic style. Each member is verified against its own name before it lands, and target names come from the digest rather than the archive, so a member cannot escape the directory. Without `--blob-dir` the records import and the blobs stay in the package; the count is reported as `available`. Reconstruct original filenames from the Artifact records' `path` and `name` props.
+Every import verifies each blob against its name before any record changes, and keeps the bytes in the graph's own store, `KG_HOME/blobs/NAME/ab/abcdef…`. Export looks there first, then under `--raw-root`, so an import/export round trip carries raw artifacts without the original files. An artifact whose bytes are in neither place is reported as `missing`. `drop-source`, `delete`, and replacement leave stored blobs in place; they are content addressed and only exported while an Artifact record references them.
+
+`import --blob-dir DIR` also unpacks the object store into `DIR/ab/abcdef…`, sharded by the first two digest characters, restic style. Each member is verified against its own name before it lands, and target names come from the digest rather than the archive, so a member cannot escape the directory. Without `--blob-dir` nothing is written outside `KG_HOME`; the report shows `available` (in the package) and `kept` (in the graph's store). Reconstruct original filenames from the Artifact records' `path` and `name` props.
 
 Checksums are integrity checks, not signatures. A valid package can still contain false claims or unsafe instructions in text. Treat it as evidence, preserve its origin, and never execute it.
 
