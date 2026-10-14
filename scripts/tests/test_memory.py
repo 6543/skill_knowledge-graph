@@ -281,3 +281,29 @@ def test_cli_note_with_unknown_link_suggests_the_id(tmp_path, monkeypatch):
     result = run("note", "cli", "--text", "x", "--about", "Skill:gpw", check=False)
     assert result.returncode == 2
     assert "Skill:skill:gpw" in result.stderr
+
+
+def test_cli_compact_search_keeps_the_document_id_of_each_evidence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    nodes = tmp_path / "nodes.jsonl"
+    record = chunk("c1", "The server timeout defaults to 30 seconds.")
+    record["props"]["document_id"] = "notes:notes.md@abc"
+    nodes.write_text(json.dumps(record) + "\n")
+    run("load", "cli", "--nodes", str(nodes))
+    result = run("search", "cli", "--keyword", "timeout", "--compact")["results"][0]
+    assert result["evidence"][0]["document_id"] == "notes:notes.md@abc"
+    assert result["document_id"] == "notes:notes.md@abc"
+
+
+def test_cli_show_and_find_agree_that_props_hold_stored_properties_only(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KG_HOME", str(tmp_path / "db"))
+    run("note", "cli", "--text", "Pin images", "--id", "lesson:pin-images")
+    shown = run("show", "cli", "--label", "Lesson", "--id", "lesson:pin-images")
+    found = run("find", "cli", "--text", "pin images")[0]
+    assert shown["id"] == found["id"] == "lesson:pin-images"
+    assert "id" not in shown["props"]
+    assert shown["props"] == found["props"]

@@ -160,3 +160,50 @@ def test_document_frequency_counts_every_chunk_not_just_the_fetched_ones(
     assert kg.document_frequency("common") == 30
     assert kg.document_frequency("singular") == 1
     assert kg.document_frequency("absent") == 0
+
+
+SEARCH_KEYS = {
+    "terms",
+    "unmatched",
+    "results",
+    "candidate_limit",
+    "capped_terms",
+    "nodes",
+}
+
+
+def test_a_result_names_the_document_node_not_the_internal_grouping_key(
+    tmp_path, monkeypatch
+):
+    node = chunk("ops", "server.md", 0, "The server timeout defaults to 30 seconds.")
+    node["props"]["document_id"] = "ops:server.md@abc"
+    kg = graph(tmp_path, monkeypatch, [node])
+    for scope in ("file", "chunk"):
+        result = kg.search(["timeout"], scope=scope)["results"][0]
+        assert result["document_id"] == "ops:server.md@abc"
+        assert result["document_id"] == result["evidence"][0]["document_id"]
+
+
+def test_a_result_without_a_recorded_document_has_no_document_id(tmp_path, monkeypatch):
+    kg = graph(tmp_path, monkeypatch, [chunk("ops", "server.md", 0, "timeout")])
+    assert kg.search(["timeout"])["results"][0]["document_id"] is None
+
+
+def test_search_returns_the_same_top_level_keys_whether_or_not_anything_matches(
+    tmp_path, monkeypatch
+):
+    kg = graph(tmp_path, monkeypatch, [chunk("ops", "server.md", 0, "timeout")])
+    cases = {
+        "match": kg.search(["timeout"]),
+        "no terms": kg.search([]),
+        "no match": kg.search(["zzznothing"]),
+        "required phrase unmatched": kg.search(
+            ["timeout", "zzznothing"], require_all=True
+        ),
+    }
+    for name, result in cases.items():
+        assert set(result) == SEARCH_KEYS, name
+    for name in ("no terms", "no match", "required phrase unmatched"):
+        assert cases[name]["capped_terms"] == [], name
+        assert cases[name]["results"] == [], name
+    assert kg.search(["zzznothing"], candidate_limit=7)["candidate_limit"] == 7

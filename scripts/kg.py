@@ -259,7 +259,7 @@ def build_parser():
     search.add_argument(
         "--compact",
         action="store_true",
-        help="evidence as id, path, lines and a 400-character snippet only",
+        help="evidence as id, document_id, path, lines and a 400-character snippet only",
     )
 
     query = command("query")
@@ -427,11 +427,14 @@ def run(args, graph):
                 f"no node {args.label}:{args.id}"
                 + (f"; did you mean {', '.join(hints)}?" if hints else "")
             )
+        # `id` is the node's identity, not a stored property; `find` agrees.
+        props = graph.props(args.label, args.id)
+        props.pop("id", None)
         return output(
             {
                 "label": args.label,
                 "id": args.id,
-                "props": graph.props(args.label, args.id),
+                "props": props,
                 "out": graph.neighbors(args.label, args.id),
                 "in": graph.neighbors(args.label, args.id, inbound=True),
             }
@@ -489,7 +492,7 @@ def run(args, graph):
 
 
 def compact_search(result: dict, width: int = 400) -> dict:
-    keep = ("id", "path", "heading", "start_line", "end_line")
+    keep = ("id", "document_id", "path", "heading", "start_line", "end_line")
     for item in result.get("results", []):
         item["evidence"] = [
             {key: evidence.get(key) for key in keep}

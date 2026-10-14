@@ -1,5 +1,5 @@
 ---
-name: knowledge-graph
+name: "knowledge-graph"
 description: Build, grow, query, and exchange persistent evidence-backed knowledge graphs from documents, code, research, infrastructure, logs, web snapshots, and text derived from media. Also the session memory that carries lessons learned, conventions, pitfalls, and open questions between sessions via .graph-skill-db packages. Use for cross-source relations, provenance, coverage, graph benchmarks, recalling or recording what was learned before, and any .graph-skill-db package. Imports merge with existing knowledge. Skip a single-file lookup that direct reading fully answers.
 ---
 
@@ -107,7 +107,100 @@ Replacement, source refresh, and retirement discard evidence. Use them only when
 
 `search` ranks chunk text and also returns up to `--nodes` (default 5) matching non-chunk nodes: lessons, findings, domain entities. `find` ranks nodes only, by label, ID, and string properties; labels the ingester makes (`WebResource`, `EnvironmentVariable`, `Document`, ...) are skipped unless named with `--label`. `show` on an unknown node fails and suggests close IDs. Add `--compact` to `search` for short evidence when context is tight.
 
+### Output shapes
+
+Each command prints one indented JSON value on stdout. A failure prints `error: ...` on stderr, exits with status 2, and prints no JSON, so check the status before parsing.
+
+**`find`** prints an array of node hits, best first, and `[]` when nothing matches. Each hit has `label`, `id`, `score`, `matched_terms`, and `props`.
+
+```json
+[
+  {
+    "label": "ConfigKey",
+    "id": "server.timeout",
+    "score": 1.0,
+    "matched_terms": ["timeout"],
+    "props": {"line": 5, "name": "timeout", "path": "server.md", "source": "ops"}
+  }
+]
+```
+
+`score` is the share of query terms the node matched, from 0 to 1. `props` is a preview: strings over 300 characters end in `...`. Use `show` for the full value.
+
+**`search`** prints an object.
+
+| Key | Type | Content |
+|---|---|---|
+| `terms` | array of strings | Query terms after tokenization, or the `--keyword` phrases |
+| `unmatched` | array of strings | Terms with no lexical match |
+| `results` | array of objects | Ranked files, or chunks with `--scope chunk`. Each has `repository`, `path`, `score`, `coverage`, `matched_terms`, `evidence`, `evidence_truncated`, `document_id` |
+| `nodes` | array of objects | Node hits in the same shape as `find` output; `[]` with `--nodes 0` |
+| `candidate_limit` | integer | The candidate cap in effect |
+| `capped_terms` | array of strings | Terms whose candidates hit that cap |
+
+All six keys are always present. When nothing matches, `results` and `capped_terms` are `[]`.
+
+Example with `--compact`, hashes shortened:
+
+```json
+{
+  "terms": ["server", "timeout"],
+  "unmatched": [],
+  "results": [
+    {
+      "repository": "ops",
+      "path": "server.md",
+      "score": 2.5,
+      "coverage": 1.0,
+      "matched_terms": ["server", "timeout"],
+      "evidence": [
+        {
+          "id": "ops:server.md@7f718ff7#chunk-000001-6a43e7b6",
+          "document_id": "ops:server.md@7f718ff7",
+          "path": "server.md",
+          "heading": "Timeout",
+          "start_line": 3,
+          "end_line": 5,
+          "text": "## Timeout\n\nThe server timeout is configured with `server.timeout`."
+        }
+      ],
+      "evidence_truncated": false,
+      "document_id": "ops:server.md@7f718ff7"
+    }
+  ],
+  "candidate_limit": 20000,
+  "capped_terms": [],
+  "nodes": [
+    {
+      "label": "ConfigKey",
+      "id": "server.timeout",
+      "score": 1.0,
+      "matched_terms": ["server", "timeout"],
+      "props": {"line": 5, "name": "timeout", "path": "server.md", "source": "ops"}
+    }
+  ]
+}
+```
+
+`coverage` is the weighted share of query terms found in the text, from 0 to 1. `score` adds path matches on top and can exceed 1, so compare scores only within one search. With `--compact` an evidence entry has exactly `id`, `document_id`, `path`, `heading`, `start_line`, `end_line`, and `text` (first 400 characters). Without it an entry carries every `Chunk` property plus `id`, `heading`, `start_line`, `end_line`, `text` (up to 1200 characters), `truncated`, `snippet_start_char`, `snippet_end_char`, and `line_range_basis`. `document_id` is the `Document` node ID, the same on a result and on its evidence, ready for `show --label Document`. It is `null` when the chunks record no document.
+
+**`show`** prints an object with `label`, `id`, `props`, `out`, and `in`.
+
+```json
+{
+  "label": "ConfigKey",
+  "id": "server.timeout",
+  "props": {"line": 5, "name": "timeout", "path": "server.md", "source": "ops"},
+  "out": [],
+  "in": [{"rel": "HAS_KEY", "label": "Service", "id": "server"}]
+}
+```
+
+`props` holds the stored properties, complete and untruncated. As in `find`, the node `id` sits beside `props`, not inside it. `out` and `in` list outgoing and incoming edges as the `rel` plus the `label` and `id` of the node at the other end; edge properties are not included. An unknown node is an error, not an empty object.
+
 Search retrieves candidates. Read the decisive source text before answering, then use graph relations for context and cross-source reasoning. Cite the path or URL, revision, and original locator. Distinguish extracted facts, hypotheses, contradictions, and unknowns. For media-derived text, identify the extractor and original page, region, slide, or timestamp. Follow [references/verification.md](references/verification.md).
+
+For a broad question, such as "is there something similar to X in the ecosystem" or "how do other projects handle Y", query the source code already stored in the graph before looking elsewhere. `search` across all sources with the concept's key terms, synonyms, and likely identifier names; stored repositories often already hold the neighbouring implementation. Stored code is a snapshot from ingest time, so when a hit becomes key to the answer or to a decision, re-read it in the real source at its current revision and say so if it has changed.
 
 `--keyword` uses FTS token phrases, case-insensitively, rather than literal substring matching. It requires all phrases unless `--any` is given. `--scope chunk` requires co-occurrence within one chunk; default file scope combines chunks of the same source, document, and revision. File ranking combines term coverage, rare-term weights, path/heading matches, and the best chunk's BM25 rank. It does not sum scores over every chunk.
 

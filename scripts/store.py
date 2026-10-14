@@ -1961,8 +1961,20 @@ class KG:
                 "invalid search scope, limit, candidate limit or score"
             )
         terms = [t for t in dict.fromkeys((t or "").strip() for t in terms or []) if t]
+
+        def answer(unmatched, results, capped, node_hits):
+            # One shape for every outcome, so callers never probe for keys.
+            return {
+                "terms": terms,
+                "unmatched": unmatched,
+                "results": results,
+                "candidate_limit": candidate_limit,
+                "capped_terms": capped,
+                "nodes": node_hits,
+            }
+
         if not terms:
-            return {"terms": [], "unmatched": [], "results": [], "nodes": []}
+            return answer([], [], [], [])
         node_hits = (
             self.find(terms, limit=nodes, require_all=require_all, source=source)
             if nodes > 0
@@ -1980,12 +1992,7 @@ class KG:
         matched = [term for term in terms if text_df[term] or location_df[term]]
         unmatched = [term for term in terms if not (text_df[term] or location_df[term])]
         if not matched or (require_all and unmatched):
-            return {
-                "terms": terms,
-                "unmatched": unmatched,
-                "results": [],
-                "nodes": node_hits,
-            }
+            return answer(unmatched, [], [], node_hits)
 
         total_chunks = (
             self.content.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 1
@@ -2085,19 +2092,11 @@ class KG:
                     "matched_terms": sorted(bucket["terms"] | bucket["location_terms"]),
                     "evidence": evidence,
                     "evidence_truncated": len(hits) > 8,
-                    "document_id": bucket["hits"][hits[0]["node_iri"]]["document_id"]
-                    if hits
-                    else None,
+                    # The Document node ID; the grouping key stays internal.
+                    "document_id": evidence[0].get("document_id") if evidence else None,
                 }
             )
-        return {
-            "terms": terms,
-            "unmatched": unmatched,
-            "results": results,
-            "candidate_limit": candidate_limit,
-            "capped_terms": capped,
-            "nodes": node_hits,
-        }
+        return answer(unmatched, results, capped, node_hits)
 
     def find(
         self,
