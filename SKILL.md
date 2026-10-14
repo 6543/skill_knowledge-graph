@@ -231,6 +231,15 @@ A `.graph-skill-db` is a ZIP container holding `manifest.json`, `nodes.jsonl`, `
   --blob-dir raw-store
 ```
 
+An Artifact `path` is relative to its ingest root, the directory that was passed to `ingest.py`, so that directory is what `--raw-root` has to name. A parent folder does not work in general, because the path says nothing about which subdirectory the file sits in. Repeat the option once per ingested source:
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" export project --out handover \
+  --raw-root raw/srcA --raw-root raw/srcB
+```
+
+One shortcut: a parent also resolves when each source lives in a directory named exactly like its `--source` name (`raw/srcA` ingested with `--source srcA`). When the report lists files as `missing` that are on disk, the root is the usual cause; check it before concluding the bytes are gone.
+
 Blobs travel by default once a `--raw-root` is given; `--no-blobs` keeps the export record-only. Files are matched by digest, not by path, so a file edited since ingest is reported as `changed` and left out rather than passed off as the original evidence. Missing files are reported the same way and do not abort the export. Import writes `raw-store/ab/abcdef…`; without `--blob-dir` the blobs stay in the package.
 
 **Artifacts over 100 MiB are never packed silently.** They come back as `oversized` in the export report. Ask the user whether to include them before rerunning with `--include-large`, and say what it costs: package size, transfer time, and disk space. Blobs are streamed, so memory stays bounded. Adjust the threshold with `--large-bytes`.

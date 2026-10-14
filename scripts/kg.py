@@ -102,7 +102,8 @@ def build_parser():
         action="append",
         dest="raw_roots",
         default=[],
-        help="ingest root holding the raw files behind Artifact records; repeatable",
+        help="ingest root holding the raw files behind Artifact records, or a parent "
+        "with one directory per source name; repeatable",
     )
     export.add_argument(
         "--no-blobs",

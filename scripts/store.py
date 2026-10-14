@@ -179,12 +179,18 @@ def graph_home() -> Path:
     return Path(os.environ.get("KG_HOME", ".kg"))
 
 
-def _blob_candidates(relative: str, root: Path):
-    """A record's path is relative to one ingest root, with or without its name."""
+def _blob_candidates(relative: str, root: Path, source=None):
+    """A record's path is relative to one ingest root, with or without its name.
+
+    A root may also be a parent holding several sources, each in a directory
+    named after its source.
+    """
     yield root / relative
     head, _, tail = relative.partition("/")
     if tail and head == root.name:
         yield root / tail
+    if isinstance(source, str) and source:
+        yield root / source / relative
 
 
 # Properties that record accumulated provenance rather than a single fact.
@@ -247,7 +253,7 @@ def resolve_blobs(
                 state, resolved = "found", candidate
                 break
         for root in roots if state == "missing" else ():
-            for candidate in _blob_candidates(relative, root):
+            for candidate in _blob_candidates(relative, root, props.get("source")):
                 if not candidate.is_file() or candidate.is_symlink():
                     continue
                 size = candidate.stat().st_size

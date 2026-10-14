@@ -214,3 +214,20 @@ def test_tampered_blob_is_rejected_before_records_merge(tmp_path, monkeypatch):
         with pytest.raises(GraphValidationError):
             graph.import_package(tampered)
         assert graph.stats()["nodes"] == 0
+
+
+def test_resolve_blobs_finds_sources_under_a_shared_parent_root(tmp_path):
+    # Artifact paths are relative to each source's ingest root, so a parent
+    # holding several sources only resolves through the source directory.
+    parent = tmp_path / "raw"
+    payload_a, payload_b = b"wrapper jar", b"other source"
+    first = raw(parent / "srcA", "gradle/gradle-wrapper.jar", payload_a)
+    first["props"]["source"] = "srcA"
+    second = raw(parent / "srcB", "gradle/gradle-wrapper.jar", payload_b)
+    second["props"]["source"] = "srcB"
+    found = resolve_blobs([first, second], [parent])
+    assert found["missing"] == [] and found["changed"] == []
+    assert found["blobs"] == {
+        first["props"]["sha256"]: parent / "srcA/gradle/gradle-wrapper.jar",
+        second["props"]["sha256"]: parent / "srcB/gradle/gradle-wrapper.jar",
+    }
