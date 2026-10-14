@@ -9,10 +9,12 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import tempfile
+import time
 import zipfile
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -27,8 +29,24 @@ JSON_TYPE = ox.NamedNode("urn:graph-skill-db:json")
 
 PACKAGE_SUFFIX = ".graph-skill-db"
 PACKAGE_FORMAT = "graph-skill-db"
-PACKAGE_VERSION = 3
+# Version 4 adds the optional usage.jsonl member. A package without usage rows
+# is still written as version 3, so older readers keep accepting it.
+PACKAGE_VERSION = 4
 PACKAGE_MEMBERS = {"manifest.json", "nodes.jsonl", "edges.jsonl"}
+USAGE_MEMBER = "usage.jsonl"
+# Counters halve once this many events (or 10 per node, if more) were counted:
+# TinyLFU-style aging, so counts favour recent use and rows of forgotten items
+# reach zero and are dropped.
+USAGE_HALVE_MIN = 10_000
+USAGE_EVENTS_PER_NODE = 10
+USAGE_ROW_KEYS = {"label", "id", "hits", "reads", "day"}
+# Relations the bundled ingester derives; any other edge into a document or
+# chunk is evidence or domain knowledge that refresh and compaction preserve.
+INGESTER_RELS = frozenset({"CONTAINS", "HAS_CHUNK", "LINKS_TO", "MENTIONS_ENV"})
+MENTION_LABELS = ("WebResource", "EnvironmentVariable")
+# Compaction: what a read keeps protected, and how fast an unused item cools.
+RECENT_READ_DAYS = 30
+USAGE_DECAY_DAYS = 90
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
 BLOB_PREFIX = "blobs/"
 BLOB_NAME = re.compile(r"^[0-9a-f]{64}$")
@@ -169,10 +187,38 @@ STOP_WORDS = {
 # Above this share of the graph, a bulk rebuild of the RDF index is cheaper than
 # applying the change record by record. Measured on a mixed prose and code corpus.
 RDF_DELTA_RATIO = 4
+PAGE_SIZE = 16384
 
 
 class GraphValidationError(ValueError):
     """Neutral graph violates the interchange contract."""
+
+
+class GraphStateError(GraphValidationError):
+    """The two stores of a graph disagree in a way that would lose data if opened."""
+
+
+# The RDF index records which SQLite revision it reflects, in a named graph that
+# default-graph queries never see. SQLite is authoritative and always commits
+# first, so an index stamped ahead of SQLite means SQLite lost committed writes.
+STATE_GRAPH = ox.NamedNode("urn:graph-skill-db:state")
+STATE_REVISION = ox.NamedNode("urn:graph-skill-db:revision")
+
+
+def usage_day() -> int:
+    """Days since 1970-01-01 UTC; a counter row stores the last day it was used."""
+    return int(time.time() // 86400)
+
+
+def day_iso(day: int | None) -> str | None:
+    return None if day is None else (date(1970, 1, 1) + timedelta(days=day)).isoformat()
+
+
+def usage_key(label: str, identifier: str) -> int:
+    """64-bit key of a node in the usage table; collisions are negligible
+    (~3e-8 at a million nodes) and would only merge two approximate counters."""
+    digest = hashlib.blake2b(f"{label}\0{identifier}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
 
 
 def graph_home() -> Path:
@@ -748,6 +794,115 @@ def note_records(
     return [node], edges
 
 
+def _usage_rows(data: bytes, declared) -> list[dict]:
+    """Validate the usage member: one row per node, small non-negative counters."""
+    if not isinstance(declared, dict) or any(
+        type(declared.get(k)) is not int or declared[k] < 0
+        for k in ("rows", "since", "generation")
+    ):
+        raise GraphValidationError("invalid manifest usage entry")
+    rows = [
+        strict_json(line) for line in data.decode("utf-8").splitlines() if line.strip()
+    ]
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != USAGE_ROW_KEYS
+            or not all(isinstance(row[k], str) and row[k] for k in ("label", "id"))
+            or any(
+                type(row[k]) is not int or row[k] < 0 for k in ("hits", "reads", "day")
+            )
+        ):
+            raise GraphValidationError(f"{USAGE_MEMBER}: invalid row {row!r}"[:200])
+    if len(rows) != declared["rows"]:
+        raise GraphValidationError(f"{USAGE_MEMBER}: row count mismatch")
+    return rows
+
+
+def diff_records(a_nodes, a_edges, b_nodes, b_edges, top: int = 20) -> dict:
+    """Compare two record sets (packages or graphs) before merging them.
+
+    Reports per-label/per-relation counts only in A, only in B, and differing;
+    memory notes unique to each side or conflicting by ID; and paths that would
+    have more than one current Document version after a union, the sign that
+    one side refreshed a source and the other did not.
+    """
+
+    def index(nodes, edges):
+        return (
+            {(n["label"], n["id"]): n.get("props") or {} for n in nodes},
+            {
+                (e["rel"], e["src_label"], e["src"], e["dst_label"], e["dst"]): e.get(
+                    "props"
+                )
+                or {}
+                for e in edges
+            },
+        )
+
+    an, ae = index(a_nodes, a_edges)
+    bn, be = index(b_nodes, b_edges)
+
+    def counts(keys):
+        return dict(sorted(Counter(key[0] for key in keys).items()))
+
+    def memory(x, y):
+        found = [
+            {
+                "label": k[0],
+                "id": k[1],
+                "statement": str(p.get("statement") or "")[:160],
+            }
+            for k, p in sorted(x.items())
+            if k[0] in MEMORY_LABELS and k not in y
+        ]
+        return found[:top]
+
+    versions: dict[tuple, set] = {}
+    for side in (an, bn):
+        for key, props in side.items():
+            if key[0] == "Document" and not props.get("outdated"):
+                versions.setdefault(
+                    (props.get("source"), props.get("path")), set()
+                ).add(key[1])
+    duplicated = sorted(k for k, v in versions.items() if len(v) > 1 and k[1])
+    return {
+        "nodes": {
+            "only_a": counts(k for k in an if k not in bn),
+            "only_b": counts(k for k in bn if k not in an),
+            "differ": counts(
+                k for k in an if k in bn and canonical(an[k]) != canonical(bn[k])
+            ),
+        },
+        "edges": {
+            "only_a": counts(k for k in ae if k not in be),
+            "only_b": counts(k for k in be if k not in ae),
+            "differ": counts(
+                k for k in ae if k in be and canonical(ae[k]) != canonical(be[k])
+            ),
+        },
+        "memory": {
+            "only_a": memory(an, bn),
+            "only_b": memory(bn, an),
+            "conflicting": [
+                {"label": k[0], "id": k[1]}
+                for k in sorted(an)
+                if k[0] in MEMORY_LABELS
+                and k in bn
+                and canonical(an[k]) != canonical(bn[k])
+            ][:top],
+        },
+        "current_versions": {
+            "paths": len(duplicated),
+            "by_source": dict(Counter(str(k[0]) for k in duplicated)),
+            "examples": [
+                {"source": k[0], "path": k[1], "versions": len(versions[k])}
+                for k in duplicated[:top]
+            ],
+        },
+    }
+
+
 class _DryRun(Exception):
     """Raised inside a transaction to roll a preview back."""
 
@@ -774,16 +929,26 @@ class KG:
         self.content_path.parent.mkdir(parents=True, exist_ok=True)
         # Acquire the exclusive graph lock before touching SQLite.
         self.store = ox.Store(str(self.graph_path))
+        self.content = None
+        self.track_usage = os.environ.get("KG_USAGE", "1") != "0"
+        self._usage_buffer: dict[int, list[int]] = {}
         try:
+            stamp = self._state_stamp()
+            if stamp is not None and not self.content_path.exists():
+                raise self._state_error(None, stamp)
             self.content = sqlite3.connect(self.content_path)
             self.content.row_factory = sqlite3.Row
             self._prepare_content()
+            # Keys are stored once: a rowid table with a (kind, key) primary key
+            # kept every key twice, in the table and again in its index.
             self.content.executescript("""
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS records(
                     kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-                    PRIMARY KEY(kind,key));
+                    PRIMARY KEY(kind,key)) WITHOUT ROWID;
             """)
+            self._check_state(stamp)
+            self._prepare_usage()
             self._prepare_node_index()
             saved = self._meta("namespace")
             inferred = set()
@@ -800,7 +965,7 @@ class KG:
                 )
             if not saved and inferred and ns is not None and ns not in inferred:
                 raise GraphValidationError("namespace conflict with legacy graph")
-            if not saved and len(self.store) and not inferred:
+            if not saved and self._triple_count() and not inferred:
                 raise GraphValidationError(
                     "cannot identify legacy namespace; export with the original skill first"
                 )
@@ -828,7 +993,13 @@ class KG:
                             if kind == "node" and record["label"] == "Chunk":
                                 self._write_chunk(record)
                     self._set_meta("revision", "1")
-            self._migrate_chunk_text()
+            migrated = self._migrate_chunk_text() | self._migrate_records_layout()
+            if (
+                migrated
+                or self.content.execute("PRAGMA page_size").fetchone()[0] != PAGE_SIZE
+            ):
+                self.content.execute(f"PRAGMA page_size={PAGE_SIZE}")
+                self.content.execute("VACUUM")
             if not rdf_existed:
                 with self.content:
                     self._set_meta("rdf_revision", "0")
@@ -840,6 +1011,11 @@ class KG:
     def close(self):
         content = getattr(self, "content", None)
         if content is not None:
+            try:
+                self._flush_usage()
+            except sqlite3.Error as exc:
+                # Counters are approximate by design; never fail a command on them.
+                print(f"warning: usage counters not saved: {exc}", file=sys.stderr)
             content.close()
             self.content = None
         if getattr(self, "store", None) is not None:
@@ -910,14 +1086,836 @@ class KG:
             record["props"] = {**props, "text": row[0]}
         return record
 
-    def _migrate_chunk_text(self) -> None:
+    # ------------------------------------------------------------------ usage
+    def _prepare_usage(self) -> None:
+        """One row per used node: hits (returned by a command) and reads (opened).
+
+        Never-used nodes have no row; `usage_since` says since when that holds.
+        """
+        with self.content:
+            self.content.execute(
+                "CREATE TABLE IF NOT EXISTS usage(h INTEGER PRIMARY KEY, "
+                "hits INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, "
+                "day INTEGER NOT NULL)"
+            )
+            if self._meta("usage_since") is None:
+                self._set_meta("usage_since", usage_day())
+
+    def record_use(self, hits=(), reads=()) -> None:
+        """Count (label, id) pairs a caller returned (hits) or opened (reads).
+
+        Counts are buffered and written in one transaction when the graph closes,
+        so a command pays one small write however many items it touched.
+        """
+        if not self.track_usage:
+            return
+        for column, items in ((0, hits), (1, reads)):
+            for label, identifier in items:
+                row = self._usage_buffer.setdefault(
+                    usage_key(label, identifier), [0, 0]
+                )
+                row[column] += 1
+
+    def _usage_halve_at(self) -> int:
+        nodes = self.content.execute(
+            "SELECT COUNT(*) FROM records WHERE kind='node'"
+        ).fetchone()[0]
+        return max(USAGE_HALVE_MIN, USAGE_EVENTS_PER_NODE * nodes)
+
+    def _halve_usage(self, steps: int = 1) -> None:
+        self.content.execute(
+            "UPDATE usage SET hits = hits >> ?, reads = reads >> ?", (steps, steps)
+        )
+        self.content.execute("DELETE FROM usage WHERE hits = 0 AND reads = 0")
+
+    def _flush_usage(self) -> None:
+        if not self._usage_buffer:
+            return
+        day = usage_day()
+        rows = [
+            (key, hits, reads, day) for key, (hits, reads) in self._usage_buffer.items()
+        ]
+        events = sum(hits + reads for _, hits, reads, _ in rows)
+        with self.content:
+            self.content.executemany(
+                "INSERT INTO usage(h, hits, reads, day) VALUES (?,?,?,?) "
+                "ON CONFLICT(h) DO UPDATE SET hits = hits + excluded.hits, "
+                "reads = reads + excluded.reads, day = excluded.day",
+                rows,
+            )
+            total = int(self._meta("usage_events") or 0) + events
+            # The threshold is never below USAGE_HALVE_MIN, so the node count it
+            # needs is only taken once that floor is reached.
+            if total >= USAGE_HALVE_MIN and total >= self._usage_halve_at():
+                self._halve_usage()
+                generation = int(self._meta("usage_generation") or 0) + 1
+                self._set_meta("usage_generation", generation)
+                total = 0
+            self._set_meta("usage_events", total)
+        self._usage_buffer.clear()
+
+    def _node_keys(self) -> dict[int, tuple[str, str]]:
+        keys = {}
+        for (key,) in self.content.execute("SELECT key FROM records WHERE kind='node'"):
+            label, identifier = strict_json(key)
+            keys[usage_key(label, identifier)] = (label, identifier)
+        return keys
+
+    def usage_rows(self) -> list[dict]:
+        """Counters of existing nodes as portable rows, sorted by label and ID."""
+        keys = self._node_keys()
+        rows = []
+        for key, hits, reads, day in self.content.execute(
+            "SELECT h, hits, reads, day FROM usage"
+        ):
+            if key in keys:
+                label, identifier = keys[key]
+                rows.append(
+                    {
+                        "label": label,
+                        "id": identifier,
+                        "hits": hits,
+                        "reads": reads,
+                        "day": day,
+                    }
+                )
+        return sorted(rows, key=lambda row: (row["label"], row["id"]))
+
+    def _usage_meta(self) -> dict:
+        return {
+            "since": int(self._meta("usage_since")),
+            "generation": int(self._meta("usage_generation") or 0),
+        }
+
+    def _merge_usage(self, rows, incoming: dict, replace: bool = False) -> int:
+        """Merge counters by maximum, so re-importing a package never double counts.
+
+        Two sessions that branched from one package can each lose the other's
+        increments; that undercount is the price of idempotent merges.
+        """
+        with self.content:
+            if replace:
+                self.content.execute("DELETE FROM usage")
+                self._set_meta("usage_generation", incoming["generation"])
+                self._set_meta("usage_events", 0)
+                self._set_meta("usage_since", incoming["since"])
+            local = self._usage_meta()
+            if incoming["generation"] > local["generation"]:
+                self._halve_usage(incoming["generation"] - local["generation"])
+                self._set_meta("usage_generation", incoming["generation"])
+                local["generation"] = incoming["generation"]
+            shift = local["generation"] - incoming["generation"]
+            merged = []
+            for row in rows:
+                hits, reads = row["hits"] >> shift, row["reads"] >> shift
+                if (hits or reads) and self.exists(row["label"], row["id"]):
+                    merged.append(
+                        (usage_key(row["label"], row["id"]), hits, reads, row["day"])
+                    )
+            self.content.executemany(
+                "INSERT INTO usage(h, hits, reads, day) VALUES (?,?,?,?) "
+                "ON CONFLICT(h) DO UPDATE SET hits = max(hits, excluded.hits), "
+                "reads = max(reads, excluded.reads), day = max(day, excluded.day)",
+                merged,
+            )
+            self._set_meta("usage_since", min(local["since"], incoming["since"]))
+        return len(merged)
+
+    def usage_report(self, top: int = 10) -> dict:
+        """Where use concentrates and which stored text nobody touched.
+
+        Reading the report is not use: it records nothing.
+        """
+        counters = {
+            key: (hits, reads, day)
+            for key, hits, reads, day in self.content.execute(
+                "SELECT h, hits, reads, day FROM usage"
+            )
+        }
+        keys = self._node_keys()
+        labels: dict[str, dict] = {}
+        for key, (label, _) in keys.items():
+            entry = labels.setdefault(
+                label, {"nodes": 0, "used": 0, "hits": 0, "reads": 0}
+            )
+            entry["nodes"] += 1
+            if key in counters:
+                entry["used"] += 1
+                entry["hits"] += counters[key][0]
+                entry["reads"] += counters[key][1]
+        text = {"bytes": 0, "used_bytes": 0, "cold_bytes": 0}
+        sources: dict[str, dict] = {}
+        documents: dict[str, dict] = {}
+        for identifier, repository, path, document, size in self.content.execute(
+            "SELECT id, repository, path, document_id, length(CAST(text AS BLOB)) "
+            "FROM chunks"
+        ):
+            used = usage_key("Chunk", identifier) in counters
+            text["bytes"] += size
+            text["used_bytes" if used else "cold_bytes"] += size
+            source = sources.setdefault(
+                repository,
+                {
+                    "source": repository,
+                    "chunks": 0,
+                    "used_chunks": 0,
+                    "text_bytes": 0,
+                    "cold_bytes": 0,
+                },
+            )
+            source["chunks"] += 1
+            source["used_chunks"] += used
+            source["text_bytes"] += size
+            source["cold_bytes"] += 0 if used else size
+            group = documents.setdefault(
+                document,
+                {
+                    "path": path,
+                    "source": repository,
+                    "chunks": 0,
+                    "text_bytes": 0,
+                    "used": False,
+                },
+            )
+            group["chunks"] += 1
+            group["text_bytes"] += size
+            group["used"] |= used
+        hot = sorted(
+            (
+                {
+                    "label": keys[key][0],
+                    "id": keys[key][1],
+                    "hits": hits,
+                    "reads": reads,
+                    "last_used": day_iso(day),
+                }
+                for key, (hits, reads, day) in counters.items()
+                if key in keys
+            ),
+            key=lambda row: (
+                -(4 * row["reads"] + row["hits"]),
+                row["label"],
+                row["id"],
+            ),
+        )
+        cold = sorted(
+            (dict(group) for group in documents.values() if not group["used"]),
+            key=lambda group: (-group["text_bytes"], group["path"]),
+        )
+        for group in cold:
+            group.pop("used")
+        meta = self._usage_meta()
+        return {
+            "tracking": {
+                "enabled": self.track_usage,
+                "since": day_iso(meta["since"]),
+                "generation": meta["generation"],
+                "events_since_halving": int(self._meta("usage_events") or 0),
+                "halve_at": self._usage_halve_at(),
+                "rows": len(counters),
+            },
+            "labels": dict(sorted(labels.items())),
+            "chunk_text": text,
+            "sources": sorted(
+                sources.values(), key=lambda s: (-s["cold_bytes"], s["source"])
+            )[:top],
+            "cold_documents": cold[:top],
+            "hot": hot[:top],
+        }
+
+    # ----------------------------------------------------------------- refresh
+    def refresh_source(
+        self,
+        source: str,
+        nodes,
+        edges=(),
+        apply: bool = False,
+        superseded_by: str | None = None,
+        bookkeeping_rels=(),
+        on_conflict: str = "incoming",
+    ) -> dict:
+        """Bring one source up to a fresh ingest without losing cited evidence.
+
+        `load --source` drops everything the source owns, including versions
+        that lessons and findings cite. Here a Document or Artifact the fresh
+        batch no longer contains is stale: with its chunks it is deleted when no
+        evidence edge touches it, and otherwise kept and marked `outdated`. A
+        version that reappears loses its marks. Ingester relations and the given
+        `bookkeeping_rels` (such as a snapshot's INCLUDES) are not evidence.
+        Everything commits in one transaction; without `apply` it is a preview.
+        The batch belongs to this one source, so by default its values win over
+        stored ones (a newer ingester can move the locators of unchanged text);
+        properties the batch does not supply, such as notes' marks, are kept.
+        """
+        if not isinstance(source, str) or not source:
+            raise GraphValidationError("source must be a non-empty string")
+        nodes, edges = list(nodes), list(edges)
+        for record in nodes + edges:
+            owners = self._owners(record)
+            if (owners and owners != {source}) or (
+                record.get("label") == "Source" and record["id"] != source
+            ):
+                raise GraphValidationError("refresh batch contains another source")
+        ignore = INGESTER_RELS | set(bookkeeping_rels)
+        today = day_iso(usage_day())
+        stored = {
+            (n["label"], n["id"]): n.get("props") or {}
+            for n in self._records_raw("node")
+        }
+        stored_edges = list(self._records_raw("edge"))
+        incident: dict[tuple, list] = {}
+        chunks_of: dict[tuple, list] = {}
+        contained = set()
+        for edge in stored_edges:
+            src, dst = (
+                (edge["src_label"], edge["src"]),
+                (edge["dst_label"], edge["dst"]),
+            )
+            incident.setdefault(src, []).append(edge)
+            incident.setdefault(dst, []).append(edge)
+            if edge["rel"] == "HAS_CHUNK":
+                chunks_of.setdefault(src, []).append(dst)
+            if edge["rel"] == "CONTAINS" and src == ("Source", source):
+                contained.add(dst)
+        versions = ("Document", "Artifact")
+        current = {
+            node
+            for node, props in stored.items()
+            if node[0] in versions
+            and (node in contained or self._owners({"props": props}) == {source})
+            and not props.get("outdated")
+        }
+        fresh = {(n["label"], n["id"]) for n in nodes if n["label"] in versions}
+        stale = sorted(current - fresh)
+        # A record the batch contains again loses its outdated marks.
+        revived = sorted(
+            (n["label"], n["id"])
+            for n in nodes
+            if stored.get((n["label"], n["id"]), {}).get("outdated")
+        )
+        # An unchanged document keeps its ID (it is derived from the file's
+        # bytes), but re-chunking it (another extractor or chunk size) yields new
+        # chunk IDs: the chunks the batch no longer attaches to it are stale too.
+        fresh_chunks: dict[tuple, set] = {}
+        for edge in edges:
+            if edge["rel"] == "HAS_CHUNK":
+                fresh_chunks.setdefault((edge["src_label"], edge["src"]), set()).add(
+                    (edge["dst_label"], edge["dst"])
+                )
+        stale_chunks = sorted(
+            chunk
+            for doc in fresh & current
+            for chunk in chunks_of.get(doc, [])
+            if chunk not in fresh_chunks.get(doc, set())
+            and not stored.get(chunk, {}).get("outdated")
+        )
+        marked, doomed = [], set()
+        for group in [[doc, *chunks_of.get(doc, [])] for doc in stale] + [
+            [chunk] for chunk in stale_chunks
+        ]:
+            if any(e["rel"] not in ignore for m in group for e in incident.get(m, [])):
+                marked.extend(group)
+            else:
+                doomed.update(group)
+        orphans = {
+            end
+            for member in doomed
+            for edge in incident.get(member, [])
+            for end in (
+                (edge["src_label"], edge["src"]),
+                (edge["dst_label"], edge["dst"]),
+            )
+            if end[0] in MENTION_LABELS
+            and all(
+                (e["src_label"], e["src"]) in doomed
+                or (e["dst_label"], e["dst"]) in doomed
+                for e in incident.get(end, [])
+            )
+        }
+        doomed |= orphans
+        evidence_before = sum(e["rel"] not in ignore for e in stored_edges)
+        marks = {"outdated": True, "outdated_since": today}
+        if superseded_by is not None:
+            marks["superseded_by"] = superseded_by
+
+        def prepare():
+            removed, changed = [], []
+            for member in sorted(doomed):
+                record = self._record("node", list(member))
+                if record:
+                    self._unput("node", record)
+                    removed.append(("node", record))
+            for edge in stored_edges:
+                ends = {
+                    (edge["src_label"], edge["src"]),
+                    (edge["dst_label"], edge["dst"]),
+                }
+                if ends & doomed:
+                    self._unput("edge", edge)
+                    removed.append(("edge", edge))
+            rewrites = [(member, True) for member in marked] + [
+                (member, False) for member in revived
+            ]
+            for member, mark in rewrites:
+                previous = self._record("node", list(member))
+                if previous is None or (mark and previous["props"].get("outdated")):
+                    continue  # keep the date it first went out of date
+                props = {
+                    k: v
+                    for k, v in previous["props"].items()
+                    if mark or k not in ("outdated", "outdated_since", "superseded_by")
+                }
+                if mark:
+                    props.update(marks)
+                current_record = {**previous, "props": props}
+                if canonical(current_record) != canonical(previous):
+                    self._put("node", current_record)
+                    changed.append(("node", previous, current_record))
+            return removed, changed
+
+        result = self.load(
+            nodes, edges, dry_run=not apply, on_conflict=on_conflict, _prepare=prepare
+        )
+        stored_keys = {self._key("edge", e) for e in stored_edges}
+        evidence_after = (
+            sum(e["rel"] not in ignore for e in self._records_raw("edge"))
+            if apply
+            else evidence_before
+            + sum(
+                e["rel"] not in ignore and self._key("edge", e) not in stored_keys
+                for e in edges
+            )
+        )
+        return {
+            "dry_run": not apply,
+            "source": source,
+            "fresh": len(fresh),
+            "added": len(fresh - set(stored)),
+            "unchanged": len(fresh & current),
+            "stale": len(stale),
+            "stale_chunks": len(stale_chunks),
+            "deleted_documents": sum(1 for d in doomed if d[0] in versions),
+            "deleted_nodes": len(doomed),
+            "marked_outdated": sum(1 for m in marked if m[0] in versions),
+            "revived": sum(1 for r in revived if r[0] in versions),
+            "orphans_removed": len(orphans),
+            "evidence_edges_before": evidence_before,
+            (
+                "evidence_edges_after" if apply else "projected_evidence_edges_after"
+            ): evidence_after,
+            "created": result.get("created"),
+            "updated": result.get("updated"),
+            **({"conflicts": result["conflicts"]} if result.get("conflicts") else {}),
+        }
+
+    # -------------------------------------------------------------- compaction
+    def store_bytes(self) -> int:
+        size = sum(p.stat().st_size for p in self.graph_path.rglob("*") if p.is_file())
+        return size + sum(
+            p.stat().st_size
+            for p in self.content_path.parent.glob(self.content_path.name + "*")
+            if p.is_file()
+        )
+
+    def _text_overhead(self) -> float:
+        """Stored bytes per byte of chunk text: table plus its full-text indexes."""
+        text = self.content.execute(
+            "SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) FROM chunks"
+        ).fetchone()[0]
+        try:
+            stored = self.content.execute(
+                "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = 'chunks' "
+                "OR name LIKE 'chunks_fts%' OR name LIKE 'locations_fts%'"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            stored = 0
+        return stored / text if text and stored else 1.3
+
+    def _keep_value(self, counters, key, since, today) -> float:
+        hits, reads, day = counters.get(key, (0, 0, since))
+        return (1 + 4 * reads + hits) * math.exp(-(today - day) / USAGE_DECAY_DAYS)
+
+    def _compaction_plan(self, today: int) -> dict:
+        nodes = {
+            (n["label"], n["id"]): n.get("props") or {}
+            for n in self._records_raw("node")
+        }
+        edges = list(self._records_raw("edge"))
+        counters = {
+            key: (hits, reads, day)
+            for key, hits, reads, day in self.content.execute(
+                "SELECT h, hits, reads, day FROM usage"
+            )
+        }
+        since = int(self._meta("usage_since") or today)
+        memory = {node for node in nodes if node[0] in MEMORY_LABELS}
+        evidence = set()
+        chunks_of: dict[tuple, list] = {}
+        incident: dict[tuple, list] = {}
+        for edge in edges:
+            src, dst = (
+                (edge["src_label"], edge["src"]),
+                (edge["dst_label"], edge["dst"]),
+            )
+            incident.setdefault(src, []).append(edge)
+            incident.setdefault(dst, []).append(edge)
+            if edge["rel"] == "HAS_CHUNK" and src[0] == "Document":
+                chunks_of.setdefault(src, []).append(dst)
+            if edge["rel"] not in INGESTER_RELS:
+                evidence |= {
+                    end for end in (src, dst) if end[0] in ("Chunk", "Document")
+                }
+        recent = {
+            node
+            for node in nodes
+            if node[0] in ("Chunk", "Document")
+            and counters.get(usage_key(*node), (0, 0, 0))[1]
+            and counters[usage_key(*node)][2] >= today - RECENT_READ_DAYS
+        }
+        protected = memory | evidence | recent
+        sizes = {
+            row[0]: row[1]
+            for row in self.content.execute(
+                "SELECT id, length(CAST(text AS BLOB)) FROM chunks"
+            )
+        }
+        overhead = self._text_overhead()
+        outdated = {
+            node
+            for node, props in nodes.items()
+            if node[0] == "Document" and props.get("outdated")
+        }
+        in_outdated = {c for doc in outdated for c in chunks_of.get(doc, [])}
+        level1 = []
+        for (label, identifier), props in nodes.items():
+            node = (label, identifier)
+            if label != "Chunk" or identifier not in sizes or node in protected:
+                continue
+            if node in in_outdated:
+                continue  # superseded versions are level 2's, as a whole
+            saving = sizes[identifier] * overhead
+            value = self._keep_value(counters, usage_key(*node), since, today)
+            level1.append(
+                {
+                    "node": node,
+                    "bytes": sizes[identifier],
+                    "saving": saving,
+                    "rank": value / max(saving, 1),
+                    "path": props.get("path"),
+                    "source": props.get("source") or props.get("repository"),
+                }
+            )
+        level1.sort(key=lambda item: (item["rank"], item["node"]))
+        level2 = []
+        for doc in sorted(outdated):
+            group = [doc, *chunks_of.get(doc, [])]
+            if any(member in protected for member in group):
+                continue
+            text = sum(
+                sizes.get(member[1], 0) for member in group if member[0] == "Chunk"
+            )
+            saving = text * overhead + sum(
+                len(canonical(nodes.get(m, {}))) for m in group
+            )
+            value = sum(
+                self._keep_value(counters, usage_key(*m), since, today) for m in group
+            )
+            level2.append(
+                {
+                    "group": group,
+                    "saving": saving,
+                    "rank": value / max(saving, 1),
+                    "path": nodes[doc].get("path"),
+                }
+            )
+        level2.sort(key=lambda item: (item["rank"], item["group"][0]))
+        return {
+            "level1": level1,
+            "level2": level2,
+            "incident": incident,
+            "protected": {
+                "memory": len(memory),
+                "evidence": len(evidence - memory),
+                "recent_reads": len(recent - evidence - memory),
+            },
+        }
+
+    def _records_raw(self, kind):
+        """Records as stored (Chunk text not hydrated): cheap full scans."""
+        for row in self.content.execute(
+            "SELECT value FROM records WHERE kind=? ORDER BY key", (kind,)
+        ):
+            yield strict_json(row[0])
+
+    def _lossless_compaction(self) -> None:
+        with self.content:
+            for table in ("chunks_fts", "node_fts"):
+                self.content.execute(f"INSERT INTO {table}({table}) VALUES('optimize')")
+        self.content.execute("VACUUM")
+
+    def _evict_text(self, chosen, today: int) -> None:
+        base = self._meta("revision")
+        changed = []
+        with self.content:
+            for item in chosen:
+                label, identifier = item["node"]
+                previous = self._record("node", [label, identifier])
+                props = {k: v for k, v in previous["props"].items() if k != "text"}
+                props["evicted"] = day_iso(today)
+                current = {**previous, "props": props}
+                self._put("node", current)
+                self.content.execute(
+                    "DELETE FROM chunks WHERE node_iri=?",
+                    (self.node_iri(label, identifier).value,),
+                )
+                changed.append(("node", previous, current))
+            self._set_meta("revision", int(base) + 1)
+        self._apply_rdf_delta(base, [], changed)
+
+    def compact(
+        self,
+        target_bytes: int | None = None,
+        target_percent: float | None = None,
+        apply: bool = False,
+        checkpoint: bool | str | Path = True,
+        lossless: bool = True,
+        lossless_only: bool = False,
+    ) -> dict:
+        """Reduce stored size by at least a target; only ever on explicit request.
+
+        Level 0 is lossless (VACUUM, full-text index merge). Level 1 evicts the
+        text of the coldest unprotected chunks and keeps a stub with digest and
+        locator, so re-ingesting the source restores it. Level 2 drops cold
+        superseded (`outdated`) document versions nobody cites. Memory nodes,
+        evidence cited by any non-ingester edge, and items read in the last
+        RECENT_READ_DAYS are never touched. Items go in order of the least kept
+        value per byte saved, and selection stops once the target is reached.
+        Without `apply` nothing changes; with it, a checkpoint package is
+        exported before the first lossy step unless `checkpoint` is False.
+        """
+        if (target_bytes is None) == (target_percent is None):
+            raise GraphValidationError(
+                "compact needs exactly one target: target_bytes or target_percent"
+            )
+        if (target_bytes is not None and target_bytes <= 0) or (
+            target_percent is not None and not 0 < target_percent <= 100
+        ):
+            raise GraphValidationError(
+                "compact target must be positive (percent <= 100)"
+            )
+        self._flush_usage()
+        today = usage_day()
+        before = self.store_bytes()
+        goal = (
+            target_bytes
+            if target_bytes is not None
+            else math.ceil(before * target_percent / 100)
+        )
+        page_size = self.content.execute("PRAGMA page_size").fetchone()[0]
+        free = self.content.execute("PRAGMA freelist_count").fetchone()[0] * page_size
+        levels = [
+            {
+                "level": 0,
+                "action": "vacuum and merge full-text indexes",
+                "lossless": True,
+                "projected_bytes": free if lossless else 0,
+            }
+        ]
+        remaining = goal
+        if lossless:
+            if apply:
+                self._lossless_compaction()
+                levels[0]["saved_bytes"] = before - self.store_bytes()
+                remaining -= levels[0]["saved_bytes"]
+            else:
+                remaining -= free
+        plan = None if lossless_only else self._compaction_plan(today)
+        chosen1, chosen2 = [], []
+        if plan:
+            for item in plan["level1"]:
+                if remaining <= 0:
+                    break
+                chosen1.append(item)
+                remaining -= item["saving"]
+            for item in plan["level2"]:
+                if remaining <= 0:
+                    break
+                chosen2.append(item)
+                remaining -= item["saving"]
+            sources = Counter(item["source"] or "" for item in chosen1)
+            levels.append(
+                {
+                    "level": 1,
+                    "action": "evict text of cold chunks, keep stub",
+                    "lossless": False,
+                    "chunks": len(chosen1),
+                    "text_bytes": sum(item["bytes"] for item in chosen1),
+                    "projected_bytes": round(sum(item["saving"] for item in chosen1)),
+                    "by_source": dict(sources.most_common(10)),
+                    "examples": [
+                        item["path"] or item["node"][1] for item in chosen1[:10]
+                    ],
+                }
+            )
+            levels.append(
+                {
+                    "level": 2,
+                    "action": "drop cold superseded document versions",
+                    "lossless": False,
+                    "documents": len(chosen2),
+                    "chunks": sum(len(item["group"]) - 1 for item in chosen2),
+                    "projected_bytes": round(sum(item["saving"] for item in chosen2)),
+                    "examples": [
+                        item["path"] or item["group"][0][1] for item in chosen2[:10]
+                    ],
+                }
+            )
+        saved_checkpoint = None
+        if apply and (chosen1 or chosen2):
+            if checkpoint is not False:
+                target = (
+                    Path(checkpoint)
+                    if not isinstance(checkpoint, bool)
+                    else self.home
+                    / "checkpoints"
+                    / (
+                        f"{self.name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+                        + PACKAGE_SUFFIX
+                    )
+                )
+                exported = self.export_package(target)
+                saved_checkpoint = {
+                    "package": exported["package"],
+                    "bytes": exported["bytes"],
+                }
+            if chosen1:
+                self._evict_text(chosen1, today)
+            if chosen2:
+                doomed = {member for item in chosen2 for member in item["group"]}
+                orphans = {
+                    end
+                    for member in doomed
+                    for edge in plan["incident"].get(member, [])
+                    for end in (
+                        (edge["src_label"], edge["src"]),
+                        (edge["dst_label"], edge["dst"]),
+                    )
+                    if end[0] in MENTION_LABELS
+                    and all(
+                        (e["src_label"], e["src"]) in doomed
+                        or (e["dst_label"], e["dst"]) in doomed
+                        for e in plan["incident"].get(end, [])
+                    )
+                }
+                self.delete(nodes=sorted(doomed | orphans))
+            self.content.execute("VACUUM")
+        after = self.store_bytes() if apply else before - (goal - remaining)
+        return {
+            "dry_run": not apply,
+            "before_bytes": before,
+            ("after_bytes" if apply else "projected_after_bytes"): after,
+            "target_bytes": goal,
+            "target_met": before - after >= goal,
+            "levels": levels,
+            "protected": plan["protected"] if plan else None,
+            # Few days of counters means the ranking is mostly by size: say so.
+            "usage_days": today - int(self._meta("usage_since") or today),
+            "checkpoint": saved_checkpoint,
+        }
+
+    # ------------------------------------------------------------ consistency
+    def _state_stamp(self) -> int | None:
+        for quad in self.store.quads_for_pattern(
+            None, STATE_REVISION, None, STATE_GRAPH
+        ):
+            return int(quad.object.value)
+        return None
+
+    def _stamp_state(self, revision) -> None:
+        self._clear_state_stamp(flush=False)
+        self.store.add(
+            ox.Quad(STATE_GRAPH, STATE_REVISION, ox.Literal(int(revision)), STATE_GRAPH)
+        )
+
+    def _clear_state_stamp(self, flush: bool = True) -> None:
+        for quad in list(
+            self.store.quads_for_pattern(None, STATE_REVISION, None, STATE_GRAPH)
+        ):
+            self.store.remove(quad)
+        if flush:
+            self.store.flush()
+
+    def _state_error(self, revision, stamp) -> GraphStateError:
+        return GraphStateError(
+            f"graph {self.name!r}: its SQLite content (revision {revision or 'none'}) "
+            f"is older than its RDF index (revision {stamp}). The content file "
+            f"{self.content_path} or its write-ahead log was lost or replaced after a "
+            "committed write. Nothing was changed. Move rdf/"
+            f"{self.name}.oxi and content/{self.name}.sqlite3* aside and import the "
+            "newest exported package; do not rebuild from the index, which has no "
+            "chunk text."
+        )
+
+    def _check_state(self, stamp) -> None:
+        """Refuse to open a graph whose SQLite store went backwards.
+
+        Opening it anyway would show an empty or partial graph and, on the next
+        write, clear the RDF index to match: the one place the facts survived.
+        """
+        revision = self._meta("revision")
+        if stamp is not None and (revision is None or int(revision) < stamp):
+            raise self._state_error(revision, stamp)
+        if (
+            stamp is None
+            and revision is not None
+            and self._meta("rdf_revision") == revision
+            and len(self.store)
+            and not self.content.execute("SELECT 1 FROM records LIMIT 1").fetchone()
+        ):
+            raise self._state_error(revision, "populated, unstamped")
+
+    def _compact_after(self, changed: int) -> None:
+        """VACUUM after a write that rewrote a large share of the graph.
+
+        Bulk inserts in key order leave pages part-filled, and deletions leave
+        free pages; on the measured corpora a VACUUM after import saved ~5%.
+        It is lossless and skipped for the small deltas of everyday work.
+        """
+        total = self.content.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        if changed >= 1000 and changed * 4 >= total:
+            self.content.execute("VACUUM")
+
+    def _triple_count(self) -> int:
+        return len(self.store) - (self._state_stamp() is not None)
+
+    def _migrate_records_layout(self) -> bool:
+        """Rebuild `records` without a rowid so each key is stored once."""
+        sql = self.content.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='records'"
+        ).fetchone()[0]
+        if "WITHOUT ROWID" in sql.upper():
+            return False
+        with self.content:
+            self.content.executescript(
+                """
+                CREATE TABLE records_migrated(
+                    kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                    PRIMARY KEY(kind,key)) WITHOUT ROWID;
+                INSERT INTO records_migrated SELECT kind, key, value FROM records;
+                DROP TABLE records;
+                ALTER TABLE records_migrated RENAME TO records;
+                """
+            )
+        return True
+
+    def _migrate_chunk_text(self) -> bool:
         """Drop the inline copy of Chunk text that earlier versions also stored.
 
         Only a copy identical to the indexed text is dropped; a disagreeing copy
-        stays inline and keeps precedence. VACUUM then returns the freed pages.
+        stays inline and keeps precedence. The caller VACUUMs once afterwards.
         """
         if self._meta("chunk_text_store") == "chunks":
-            return
+            return False
         stripped = 0
         with self.content:
             rows = self.content.execute(
@@ -939,8 +1937,7 @@ class KG:
                 )
                 stripped += 1
             self._set_meta("chunk_text_store", "chunks")
-        if stripped:
-            self.content.execute("VACUUM")
+        return bool(stripped)
 
     def _put(self, kind, record):
         key = self._key(kind, record)
@@ -1040,6 +2037,7 @@ class KG:
         # on reopen before a query can observe it.
         self.store.clear()
         self.store.bulk_extend(self._quads())
+        self._stamp_state(revision)
         self.store.flush()
         with self.content:
             self._set_meta("rdf_revision", revision)
@@ -1105,6 +2103,7 @@ class KG:
                 for quad in self._record_quads(kind, previous):
                     self.store.remove(quad)
             self.store.extend(list(self._record_quads(kind, incoming)))
+        self._stamp_state(self._meta("revision"))
         self.store.flush()
         with self.content:
             self._set_meta("rdf_revision", self._meta("revision"))
@@ -1121,7 +2120,15 @@ class KG:
     def _prepare_content(self) -> None:
         self.content.executescript(
             """
-            PRAGMA journal_mode=WAL;
+            -- A rollback journal, not WAL: one process holds the graph at a time,
+            -- so WAL buys no concurrency, and with WAL a committed write lived
+            -- only in the -wal file until a checkpoint. A killed process plus a
+            -- lost -wal file reopened the graph empty (reported twice).
+            PRAGMA journal_mode=DELETE;
+            -- Record rows run to ~1 KB; at 4 KiB pages a key-ordered table spills
+            -- them to half-empty overflow pages. Applies to new files; existing
+            -- ones adopt it at their next migration VACUUM.
+            PRAGMA page_size=16384;
             PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS chunks (
                 rowid INTEGER PRIMARY KEY,
@@ -1281,6 +2288,7 @@ class KG:
             result = self._drop_source(source)
             self._set_meta("revision", int(base) + 1)
         self._apply_rdf_delta(base, result["removed_records"], [])
+        self._compact_after(len(result["removed_records"]))
         return self._report(result)
 
     def load(
@@ -1291,6 +2299,7 @@ class KG:
         source: str | None = None,
         on_conflict: str = "error",
         dry_run: bool = False,
+        _prepare=None,
     ) -> dict:
         """Commit a complete additive batch; conflicting fields require an explicit policy.
 
@@ -1335,7 +2344,7 @@ class KG:
         base_revision = self._meta("revision")
         try:
             report = self._load_transaction(
-                nodes, edges, replace, source, on_conflict, dry_run
+                nodes, edges, replace, source, on_conflict, dry_run, _prepare
             )
         except _DryRun as preview:
             return preview.args[0]
@@ -1353,6 +2362,7 @@ class KG:
             self._ensure_rdf()
         elif changed:
             self._apply_rdf_delta(base_revision, removed_records, changed_records)
+        self._compact_after(changed)
         return {
             **validation,
             "mode": "replace"
@@ -1362,7 +2372,7 @@ class KG:
             else "merge",
             "created": created,
             "updated": updated,
-            "triples": len(self.store),
+            "triples": self._triple_count(),
             "chunks_written": written,
             "chunks_total": self.content.execute(
                 "SELECT COUNT(*) FROM chunks"
@@ -1371,7 +2381,9 @@ class KG:
             "content_store": str(self.content_path),
         }
 
-    def _load_transaction(self, nodes, edges, replace, source, on_conflict, dry_run):
+    def _load_transaction(
+        self, nodes, edges, replace, source, on_conflict, dry_run, prepare=None
+    ):
         written = changed = created = updated = 0
         removed_records = []
         changed_records = []
@@ -1388,6 +2400,13 @@ class KG:
                 dropped = self._drop_source(source)
                 removed_records = dropped["removed_records"]
                 changed += dropped["subjects_removed"] + dropped["edges_removed"]
+            if prepare is not None:
+                # Runs inside this transaction, so its removals and rewrites
+                # commit (or roll back, or preview) together with the batch.
+                extra_removed, extra_changed = prepare()
+                removed_records = [*removed_records, *extra_removed]
+                changed_records.extend(extra_changed)
+                changed += len(extra_removed) + len(extra_changed)
             validation = validate_graph(
                 nodes, edges, resolve=self.exists if not replace else None
             )
@@ -1418,6 +2437,14 @@ class KG:
                             conflicts.append((kind, key, prop, props[prop], value))
                             continue
                         props[prop] = value
+                    if (
+                        kind == "node"
+                        and incoming["label"] == "Chunk"
+                        and "text" in (incoming.get("props") or {})
+                        and "evicted" not in (incoming.get("props") or {})
+                    ):
+                        # Re-ingesting the text restores a chunk `compact` evicted.
+                        props.pop("evicted", None)
                     if props or kind == "node" or "props" in incoming:
                         incoming["props"] = props
                     if previous and canonical(previous) == canonical(incoming):
@@ -1604,6 +2631,7 @@ class KG:
         blobs: bool = True,
         large_bytes: int = LARGE_BLOB_BYTES,
         include_large: bool = False,
+        usage: bool = True,
     ) -> dict:
         """Atomically export portable neutral records in a ZIP container.
 
@@ -1632,13 +2660,18 @@ class KG:
             digest: source.stat().st_size
             for digest, source in sorted(found["blobs"].items())
         }
+        self._flush_usage()  # this process's own use belongs in the package too
+        usage_rows = self.usage_rows() if usage else []
+        members = [("nodes.jsonl", nodes), ("edges.jsonl", edges)]
+        if usage_rows:
+            members.append((USAGE_MEMBER, usage_rows))
         payloads = {
             name: "".join(canonical(r) + "\n" for r in records).encode("utf-8")
-            for name, records in (("nodes.jsonl", nodes), ("edges.jsonl", edges))
+            for name, records in members
         }
         manifest = {
             "format": PACKAGE_FORMAT,
-            "version": PACKAGE_VERSION,
+            "version": PACKAGE_VERSION if usage_rows else 3,
             "graph": self.name,
             "namespace": self.ns,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1655,6 +2688,8 @@ class KG:
             },
             "blobs": dict(stored),
         }
+        if usage_rows:
+            manifest["usage"] = {**self._usage_meta(), "rows": len(usage_rows)}
         payloads["manifest.json"] = canonical(manifest).encode("utf-8")
         if sum(map(len, payloads.values())) + sum(stored.values()) > max_bytes:
             raise GraphValidationError(
@@ -1699,7 +2734,10 @@ class KG:
         }
 
     @staticmethod
-    def read_package(path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES):
+    def read_package(
+        path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES, with_usage: bool = False
+    ):
+        """Validate a package; returns (manifest, nodes, edges[, usage rows])."""
         path = Path(path)
         if max_bytes <= 0:
             raise GraphValidationError("max_bytes must be positive")
@@ -1715,9 +2753,9 @@ class KG:
                         f"{path}: archive is missing {sorted(missing)}"
                     )
                 blob_names = [name for name in names if name.startswith(BLOB_PREFIX)]
-                if len(names) != len(set(names)) or set(names) - PACKAGE_MEMBERS - set(
-                    blob_names
-                ):
+                if len(names) != len(set(names)) or set(names) - PACKAGE_MEMBERS - {
+                    USAGE_MEMBER
+                } - set(blob_names):
                     raise GraphValidationError(
                         "duplicate or unexpected archive members"
                     )
@@ -1774,8 +2812,16 @@ class KG:
                     for k in ("nodes", "edges")
                 ):
                     raise GraphValidationError("invalid manifest counts")
+                has_usage = USAGE_MEMBER in names
+                if has_usage != (version >= 4 and "usage" in manifest):
+                    raise GraphValidationError(
+                        f"{USAGE_MEMBER} and the manifest usage entry must come together "
+                        "in a version 4 package"
+                    )
                 payloads = {
-                    name: archive.read(name) for name in ("nodes.jsonl", "edges.jsonl")
+                    name: archive.read(name)
+                    for name in ("nodes.jsonl", "edges.jsonl")
+                    + ((USAGE_MEMBER,) if has_usage else ())
                 }
                 if version >= 2:
                     checks = manifest.get("members")
@@ -1791,6 +2837,11 @@ class KG:
                             raise GraphValidationError(f"{name}: byte count mismatch")
                         if check.get("sha256") != hashlib.sha256(data).hexdigest():
                             raise GraphValidationError(f"{name}: checksum mismatch")
+                usage_rows = (
+                    _usage_rows(payloads[USAGE_MEMBER], manifest["usage"])
+                    if has_usage
+                    else []
+                )
                 records = []
                 for name in ("nodes.jsonl", "edges.jsonl"):
                     records.append(
@@ -1817,6 +2868,8 @@ class KG:
                 ):
                     if field in manifest and manifest[field] != dict(actual):
                         raise GraphValidationError(f"manifest {field} mismatch")
+                if with_usage:
+                    return manifest, nodes, edges, usage_rows
                 return manifest, nodes, edges
         except (
             ValueError,
@@ -1837,8 +2890,37 @@ class KG:
         max_bytes: int = MAX_PACKAGE_BYTES,
         blob_dir: str | Path | None = None,
         dry_run: bool = False,
+        usage: bool = True,
+        memory_only: bool = False,
     ) -> dict:
-        manifest, nodes, edges = self.read_package(path, max_bytes=max_bytes)
+        """Merge a package. With `memory_only`, take only the memory notes and the
+        nodes their edges reach: the way to merge a fork's lessons without bringing
+        back source versions this graph has already refreshed or pruned."""
+        manifest, nodes, edges, usage_rows = self.read_package(
+            path, max_bytes=max_bytes, with_usage=True
+        )
+        selection = None
+        if memory_only:
+            memory = {
+                (n["label"], n["id"]) for n in nodes if n["label"] in MEMORY_LABELS
+            }
+            edges = [
+                e
+                for e in edges
+                if (e["src_label"], e["src"]) in memory
+                or (e["dst_label"], e["dst"]) in memory
+            ]
+            reached = {
+                end
+                for e in edges
+                for end in ((e["src_label"], e["src"]), (e["dst_label"], e["dst"]))
+            } - memory
+            nodes = [n for n in nodes if (n["label"], n["id"]) in memory | reached]
+            selection = {
+                "memory_nodes": len(memory),
+                "evidence_nodes": len(reached),
+                "edges": len(edges),
+            }
         if dry_run:
             return {
                 **self.load(
@@ -1846,12 +2928,20 @@ class KG:
                 ),
                 "package": str(path),
                 "manifest": manifest,
+                **({"memory_only": selection} if selection else {}),
             }
         # Blobs are verified and kept before any record changes: a package whose
         # bytes do not match their digests is rejected as a whole, and the bytes
         # that do arrive stay with the graph for its next export.
         kept = extract_blobs(path, self.blob_path)
         result = self.load(nodes, edges, replace=replace, on_conflict=on_conflict)
+        merged = 0
+        if usage and (usage_rows or replace):
+            merged = self._merge_usage(
+                usage_rows,
+                manifest.get("usage") or {"generation": 0, "since": usage_day()},
+                replace=replace,
+            )
         blobs = extract_blobs(path, blob_dir) if blob_dir else skipped_blobs(manifest)
         blobs["kept"] = kept["extracted"]
         blobs["store"] = kept["dir"]
@@ -1863,6 +2953,8 @@ class KG:
             if manifest["version"] >= 2
             else "legacy-no-checksums",
             "blobs": blobs,
+            "usage": {"rows": len(usage_rows), "merged": merged},
+            **({"memory_only": selection} if selection else {}),
         }
 
     # -------------------------------------------------------------------- read
@@ -2371,6 +3463,7 @@ class KG:
                 self._unput(kind, record)
             self._set_meta("revision", int(base) + 1)
         self._apply_rdf_delta(base, removed, [])
+        self._compact_after(len(removed))
         return report
 
     def search_keywords(
@@ -2428,7 +3521,7 @@ class KG:
             if p.is_file()
         )
         return {
-            "triples": len(self.store),
+            "triples": self._triple_count(),
             "nodes": sum(labels.values()),
             "chunks": chunks,
             "sources": sources,

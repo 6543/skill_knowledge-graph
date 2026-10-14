@@ -203,7 +203,7 @@ def test_dropping_a_source_takes_its_edge_provenance_with_it(tmp_path, monkeypat
     report = kg.drop_source("alpha")
 
     assert report["edge_facts_removed"] == 1
-    assert len(kg.store) == 0
+    assert kg._triple_count() == 0
 
 
 def test_a_source_with_no_chunks_is_still_reported(tmp_path, monkeypatch):

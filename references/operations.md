@@ -2,7 +2,11 @@
 
 ## Durable storage and recovery
 
-`KG_HOME` contains `content/NAME.sqlite3`, `rdf/NAME.oxi`, and `blobs/NAME/` for imported raw artifact bytes. SQLite is authoritative: neutral records, metadata, chunk bodies, and FTS indexes commit together with WAL and synchronous FULL. Oxigraph is a derived topology index. Never edit either store directly.
+`KG_HOME` contains `content/NAME.sqlite3`, `rdf/NAME.oxi`, and `blobs/NAME/` for imported raw artifact bytes. SQLite is authoritative: neutral records, metadata, chunk bodies, usage counters, and FTS indexes commit together with a rollback journal and synchronous FULL. Oxigraph is a derived topology index. Never edit either store directly.
+
+A committed write is in the main SQLite file when the command returns. Earlier versions used WAL, where a commit could live only in the `-wal` file until a checkpoint; a killed process plus a lost `-wal` file reopened the graph empty while the RDF index still held everything. The RDF index now records which SQLite revision it reflects, in a named graph that queries never see. If SQLite is older than the index, or empty while an unstamped index at the same revision is populated, opening fails with "older than its RDF index" and changes nothing. Do not delete files to get past it: move both stores aside and import the newest exported package. Rebuilding records from the index would lose all chunk text.
+
+Opening a graph written by an earlier version migrates it once: chunk text is stored once, record keys are stored once (a `WITHOUT ROWID` table), pages become 16 KiB so ~1 KB records stay off overflow pages, and one `VACUUM` reclaims the space. Importing into an old graph opens it first, so it migrates too. On the woodpecker and kithara example packages this took 3.1 s and 1.3 s and cut the SQLite file from 206.9 MB to 141.2 MB and from 83.0 MB to 55.7 MB. A write that changes at least 1,000 records and a quarter of the graph (large import, `drop-source`, bulk `delete`) ends with a `VACUUM`; small deltas never pay for one.
 
 The code acquires Oxigraph's exclusive lock before opening SQLite. Use one `KG` instance per named graph, close it, and run CLI commands sequentially. Different graphs can be used independently. Python usage:
 
@@ -17,7 +21,7 @@ Malformed batches, missing endpoints, property collisions, and SQL transaction f
 
 The index is moved forward by the records a write actually touched, rather than being rebuilt whole every time. A rebuild is still used for a full replacement, for the first open of a graph whose index is missing or stale, and whenever the change covers a large enough share of the graph that the bulk path is cheaper. This is what keeps adding a single fact to a large graph a sub-second operation instead of one proportional to the whole corpus; both paths produce an identical index, which the tests assert directly.
 
-This is recoverable consistency across two engines, not a distributed transaction. A process holding `graph.store` directly can bypass recovery; use the supported KG methods. Do not copy live database files as a backup. Use `export`, or close all writers and copy the complete graph directory including any WAL files. Package writes use a temporary file and atomic rename so an interrupted export does not truncate an existing package.
+This is recoverable consistency across two engines, not a distributed transaction. A process holding `graph.store` directly can bypass recovery; use the supported KG methods. Do not copy live database files as a backup. Use `export`, or close all writers and copy the complete graph directory. Package writes use a temporary file and atomic rename so an interrupted export does not truncate an existing package.
 
 Older local draft stores migrate on first open by reconstructing neutral records and rebuilding chunk identity/indexes. Their previously discarded or stringified properties cannot be recovered automatically. Export and preserve the old graph before upgrading when the old tool is available. Legacy namespaces are inferred only from recognizable node/type IRIs; ambiguity fails rather than silently importing an empty graph. New stores persist their namespace. Explicitly reopening with a conflicting namespace fails.
 
@@ -31,7 +35,20 @@ The ingester records `Source.roots` as the basename of each input. Pass `ingest.
 
 A rejected batch lists every conflicting field, the first 20 in full. `load --dry-run` and `import --dry-run` run the whole batch inside the transaction and roll it back: the report gives `created`, `updated`, `removed`, and every conflict with stored and incoming values, and nothing is written (an import dry run also skips blob extraction). Use it before merging a package from another lineage.
 
-`load --replace` replaces the whole graph. `load --source NAME` refreshes that source and rejects batches tagged to other sources. Edge endpoints may resolve against surviving external nodes. `drop-source --source NAME` retires it. These operations are explicit and destructive.
+`load --replace` replaces the whole graph. `load --source NAME` replaces that source wholesale and rejects batches tagged to other sources; it also drops every edge into the replaced versions, including evidence links. Edge endpoints may resolve against surviving external nodes. `drop-source --source NAME` retires it. These operations are explicit and destructive.
+
+`refresh --source NAME` is the evidence-preserving way to bring a source up to date. It compares a fresh ingest of that one source with the current versions:
+
+- A `Document` or `Artifact` the fresh batch no longer contains is stale. With its chunks it is deleted when no evidence edge touches it, and otherwise kept with `outdated: true`, `outdated_since` (UTC date) and, with `--superseded-by`, `superseded_by`.
+- An unchanged document keeps its ID, but re-chunking (another chunk size or ingester version) yields new chunk IDs. Its chunks the batch no longer attaches are judged the same way (`stale_chunks`).
+- Evidence is any edge whose relation is not an ingester relation (`CONTAINS`, `HAS_CHUNK`, `LINKS_TO`, `MENTIONS_ENV`). Name bookkeeping relations such as a snapshot's `INCLUDES` with `--bookkeeping-rel` so they do not keep versions alive.
+- A record the batch contains again loses its `outdated` marks.
+- `WebResource` and `EnvironmentVariable` nodes left without edges go too.
+- The batch belongs to the one source, so its values win for that source's records (`--on-conflict incoming` is the default; a newer ingester can move the locators of unchanged text). Properties the batch does not supply are kept.
+
+Everything commits in one transaction; without `--apply` it is a preview. Check that `evidence_edges_after` equals `evidence_edges_before`, then rerun the dry run: it must report nothing stale, created or updated. On the woodpecker example a refresh of `autoscaler` took 2.0 s and its rerun reported no changes.
+
+`diff --file A --file B` (or `--graph NAME --file B`) compares two lineages before a merge: counts per label and relation only in A, only in B, and differing; memory notes unique to each side or conflicting by ID; and `(source, path)` pairs that would have more than one current `Document` version after a union. Plain `import` of a fork brings back source versions this graph already refreshed or pruned. `import --memory-only` takes only the memory notes and the nodes their edges reach (the cited evidence), which is the merge for a fork's lessons. Run `refresh` per source afterwards when the diff shows duplicate current versions.
 
 Ownership is deliberately narrow:
 
@@ -47,9 +64,36 @@ The ingester gives documents/artifacts IDs including the raw content digest, and
 
 ## Explicit removal and cleanup
 
-`delete --node LABEL:ID` (repeatable) removes those nodes, their chunk text, and every incident edge. `prune` removes `LINKS_TO` and `MENTIONS_ENV` edges from bundled-ingester chunks (`extractor` `plain-text@…` or `html-text@…`, no edge props) that the current ingester would no longer derive from the chunk text, then removes `WebResource` and `EnvironmentVariable` nodes left without any edge (`--orphan-label` changes that set). Domain edges and edges with props are never judged. Both preview by default and act only with `--apply`.
+`delete --node LABEL:ID` (repeatable) removes those nodes, their chunk text, and every incident edge. `delete --from FILE` takes `LABEL:ID` lines or JSON node records (blank lines and `#` comments skipped) and removes them all in one transaction; 2,000 nodes took 1.5 s on the woodpecker example, against 0.7 s per call one node at a time. `prune` removes `LINKS_TO` and `MENTIONS_ENV` edges from bundled-ingester chunks (`extractor` `plain-text@…` or `html-text@…`, no edge props) that the current ingester would no longer derive from the chunk text, then removes `WebResource` and `EnvironmentVariable` nodes left without any edge (`--orphan-label` changes that set). Domain edges and edges with props are never judged. Both preview by default and act only with `--apply`.
 
 Merging never deletes, so an older package brings back whatever a later cleanup removed, for example URL mentions from before a fix to the ingester. Run `prune` after such a merge. `prune` does not add mentions the fixed ingester would now create; re-ingest the source for that.
+
+## Usage counters and compaction
+
+Table `usage(h, hits, reads, day)` holds one row per used node: `h` is a 64-bit BLAKE2b key of label and ID, `day` the last day of use (days since 1970-01-01 UTC). Never-used nodes have no row; metadata `usage_since` says since when that holds. A row costs about 25 bytes.
+
+What counts:
+
+| Command | Counted |
+|---|---|
+| `search` | every evidence chunk and returned node, as hits |
+| `find`, `brief` | every returned node, as hits |
+| `neighbors`, `reach --node-label` | every returned node, as hits |
+| `show` | the shown node, as one read |
+
+`usage`, `export`, `stats`, validation and dry runs count nothing. Counts are buffered and written in one transaction when the graph closes, about 1.5 ms per command on the woodpecker example. `KG_USAGE=0` turns tracking off for a process. Python callers count their own use with `graph.record_use(hits=[(label, id)], reads=[...])`.
+
+Aging follows TinyLFU: after `max(10,000, 10 × nodes)` events every counter is halved, rows that reach zero are deleted, and `usage_generation` increases. Counts therefore favour recent use, and the table stays bounded by what is still in use. Counters are approximate by design; a failed counter write warns on stderr and never fails the command.
+
+`usage` reports tracking state, per-label nodes/used/hits/reads, chunk text bytes split into used and cold, sources by cold bytes, the largest documents nobody touched, and the hottest nodes. `--dump FILE` writes every row as JSONL for frequency analysis or sampling.
+
+`compact` reduces size only by an explicit target, `--target-bytes N` (remove at least N bytes) or `--target-percent P` (remove at least P% of the current size). It previews unless `--apply`. In order, stopping once the target is met:
+
+- Level 0, lossless: `VACUUM` and a merge of the full-text indexes.
+- Level 1: evict the text of the coldest unprotected chunks of current documents. A stub keeps every property except `text`, plus `evicted` (UTC date); `sha256`, path and locators stay. Search no longer matches it. Re-ingesting the same text restores it and removes the mark.
+- Level 2: delete cold `outdated` document versions, with their chunks, that nothing protects.
+
+Never touched: memory-label nodes, chunks and documents any non-ingester edge touches (cited evidence, domain links), and anything read in the last 30 days. Within a level, items go in order of least kept value per byte saved, where kept value is `(1 + 4 × reads + hits) × exp(−days since last use / 90)` and never-used items count from `usage_since`. Before the first lossy step a checkpoint package is exported to `KG_HOME/checkpoints/` (or `--checkpoint PATH`; `--no-checkpoint` skips it); import it to undo. `--lossless-only` runs level 0 alone and takes no checkpoint.
 
 ## Node search
 
@@ -68,7 +112,8 @@ Container suffix: `.graph-skill-db`. Container format: ZIP. Only these regular m
 | `manifest.json` | UTF-8 JSON object |
 | `nodes.jsonl` | UTF-8 neutral node records, one JSON object per nonblank line |
 | `edges.jsonl` | UTF-8 neutral edge records, one JSON object per nonblank line |
-| `blobs/<sha256>` | Version 3 only. Raw bytes of one referenced artifact, named by its digest |
+| `blobs/<sha256>` | Version 3 and later. Raw bytes of one referenced artifact, named by its digest |
+| `usage.jsonl` | Version 4 only, optional. One usage row per used node: `{"label","id","hits","reads","day"}` |
 
 Version 3 manifest example:
 
@@ -95,7 +140,9 @@ Counts and hashes above are illustrative. Hash the exact uncompressed member byt
 
 The importer rejects duplicate/unknown member names, blob names that are not 64 lowercase hexadecimal characters, directories/symlinks, encrypted entries, unknown versions, invalid UTF-8/JSON, duplicate JSON keys, non-finite values, inconsistent counts/hashes, invalid record types, and unresolved endpoints. Only stored or deflate ZIP compression is supported. It reads members as data without extracting paths or executing content. Every package must be self-contained; use `load` for deltas referencing an existing graph.
 
-Default total uncompressed limit: 512 MiB. Manifest limit: 1 MiB. Export/import/inspect expose `--max-bytes` for a reviewed larger package. JSON objects take more memory than encoded bytes; use substantially smaller packages on constrained systems. Version 1 packages from the draft are accepted after structural/count validation, but have no checksum assurance. Exports always use version 3; version 2 packages, which carry records only, stay readable. Existing type loss in a version 1 export is irreversible without the original neutral records.
+Version 4 adds `usage.jsonl` together with a manifest entry `"usage": {"rows": N, "since": DAY, "generation": G}`; the member is listed in `members` with its byte count and hash. Rows are validated as one object per line with exactly those five keys, nonempty strings and nonnegative integers. Export writes counters of existing nodes by default (`export --no-usage` leaves them out). A package without usage rows is still written as version 3, so older readers keep accepting it. Import merges counters by maximum per node after aligning halving generations, so re-importing a package never double counts; two sessions that branched from one package can each lose part of the other's increments. Rows for nodes not in the graph are skipped. `import --replace` replaces the counters too; `import --no-usage` ignores them; a dry run leaves them alone.
+
+Default total uncompressed limit: 512 MiB. Manifest limit: 1 MiB. Export/import/inspect expose `--max-bytes` for a reviewed larger package. JSON objects take more memory than encoded bytes; use substantially smaller packages on constrained systems. Version 1 packages from the draft are accepted after structural/count validation, but have no checksum assurance. Exports use version 4 when they carry usage rows and version 3 otherwise; version 2 packages, which carry records only, stay readable. Existing type loss in a version 1 export is irreversible without the original neutral records.
 
 ### Raw artifact bytes
 

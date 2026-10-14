@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from store import KG, GraphValidationError
+from store import KG, STATE_GRAPH, GraphValidationError
 
 
 def node(identifier, label="Thing", **props):
@@ -274,11 +274,14 @@ def test_an_incremental_update_leaves_the_index_identical_to_a_rebuild(kg):
     )
     kg.load([node("d", source="ops")], [], source="ops")
     kg.drop_source("ops")
-    incremental = sorted(str(quad) for quad in kg.store)
+    data = lambda: sorted(  # noqa: E731  the revision stamp is not data
+        str(quad) for quad in kg.store if quad.graph_name != STATE_GRAPH
+    )
+    incremental = data()
 
     kg.store.clear()
     kg.store.bulk_extend(kg._quads())
-    assert sorted(str(quad) for quad in kg.store) == incremental
+    assert data() == incremental
 
 
 def test_edge_conflict_and_partial_properties(kg):

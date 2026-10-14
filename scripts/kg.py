@@ -15,6 +15,7 @@ from store import (
     MAX_PACKAGE_BYTES,
     MIN_SCORE,
     GraphValidationError,
+    diff_records,
     note_records,
     parse_ref,
     read_records,
@@ -118,6 +119,12 @@ def build_parser():
         help="size above which an artifact is deferred instead of packed",
     )
     export.add_argument(
+        "--no-usage",
+        dest="usage",
+        action="store_false",
+        help="leave the usage counters out of the package",
+    )
+    export.add_argument(
         "--include-large",
         action="store_true",
         help="pack deferred oversized artifacts; ask the user before using this",
@@ -138,6 +145,17 @@ def build_parser():
         "--replace", action="store_true", help="discard the current graph first"
     )
     importer.add_argument(
+        "--memory-only",
+        action="store_true",
+        help="take only memory notes and the nodes their edges reach (merging a fork)",
+    )
+    importer.add_argument(
+        "--no-usage",
+        dest="usage",
+        action="store_false",
+        help="ignore the package's usage counters",
+    )
+    importer.add_argument(
         "--dry-run",
         action="store_true",
         help="report what would change and every conflict; write nothing",
@@ -147,6 +165,36 @@ def build_parser():
     )
     export.add_argument(
         "--verbose", action="store_true", help="print every path in the report"
+    )
+
+    diff = commands.add_parser(
+        "diff", help="compare two packages, or a graph and a package, before merging"
+    )
+    diff.add_argument("--file", type=Path, action="append", default=[])
+    diff.add_argument("--graph", help="compare this graph with one --file")
+    diff.add_argument("--top", type=int, default=20)
+
+    refresh = command(
+        "refresh", help="update one source from a fresh ingest, keeping cited evidence"
+    )
+    refresh.add_argument("--source", required=True)
+    refresh.add_argument("--nodes", type=Path, required=True)
+    refresh.add_argument("--edges", type=Path)
+    refresh.add_argument("--apply", action="store_true", help="actually refresh")
+    refresh.add_argument(
+        "--superseded-by", help="recorded on versions marked outdated, e.g. a commit"
+    )
+    refresh.add_argument(
+        "--on-conflict",
+        choices=("incoming", "error"),
+        default="incoming",
+        help="the fresh ingest wins for this source's records (default)",
+    )
+    refresh.add_argument(
+        "--bookkeeping-rel",
+        action="append",
+        default=[],
+        help="relation that is not evidence (e.g. a snapshot's INCLUDES); repeatable",
     )
 
     inspect = commands.add_parser("inspect", help="read an archive without loading it")
@@ -161,6 +209,37 @@ def build_parser():
     drop.add_argument("--source", required=True)
 
     command("stats", help="labels, relations, sources, and store size")
+
+    compact_cmd = command(
+        "compact",
+        help="reduce stored size by a target; only when the user explicitly asks",
+    )
+    goal = compact_cmd.add_mutually_exclusive_group(required=True)
+    goal.add_argument(
+        "--target-bytes", type=int, help="remove at least this many bytes"
+    )
+    goal.add_argument(
+        "--target-percent", type=float, help="remove at least this share of the size"
+    )
+    compact_cmd.add_argument("--apply", action="store_true", help="actually reduce")
+    where = compact_cmd.add_mutually_exclusive_group()
+    where.add_argument(
+        "--checkpoint", type=Path, help="checkpoint package path (default: KG_HOME)"
+    )
+    where.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="skip the checkpoint export before lossy steps",
+    )
+    compact_cmd.add_argument(
+        "--lossless-only", action="store_true", help="only VACUUM and index merges"
+    )
+
+    usage = command("usage", help="what was used, and which stored text nobody touched")
+    usage.add_argument("--top", type=int, default=10)
+    usage.add_argument(
+        "--dump", type=Path, help="also write every counter row as JSONL for analysis"
+    )
 
     brief = command("brief", help="session start: memory nodes newest first")
     brief.add_argument(
@@ -199,7 +278,14 @@ def build_parser():
     delete = command(
         "delete", help="remove nodes with their edges; previews by default"
     )
-    delete.add_argument("--node", action="append", required=True, help="LABEL:ID")
+    targets = delete.add_mutually_exclusive_group(required=True)
+    targets.add_argument("--node", action="append", help="LABEL:ID; repeatable")
+    targets.add_argument(
+        "--from",
+        dest="from_file",
+        type=Path,
+        help="file of LABEL:ID lines or JSON node records; one transaction",
+    )
     delete.add_argument("--apply", action="store_true", help="actually delete")
 
     prune = command(
@@ -270,9 +356,11 @@ def build_parser():
     return parser
 
 
-def main():
-    args = build_parser().parse_args()
+STANDALONE = {"validate", "inspect", "diff"}
 
+
+def standalone(args):
+    """Commands that read files (and at most one graph) instead of one graph."""
     if args.command == "validate":
         return output(
             validate_graph(
@@ -289,6 +377,40 @@ def main():
                 "read_blobs": len(manifest.get("blobs") or {}),
             }
         )
+    if args.command == "diff":
+        if len(args.file) + bool(args.graph) != 2:
+            raise GraphValidationError(
+                "diff needs two sides: --file A --file B, or --graph G --file B"
+            )
+        sides = []
+        if args.graph:
+            with KG(args.graph) as graph:
+                sides.append(graph.export_records())
+        for path in args.file:
+            _manifest, nodes, edges = KG.read_package(path)
+            sides.append((nodes, edges))
+        return output(diff_records(*sides[0], *sides[1], top=args.top))
+
+
+def read_refs(path: Path) -> list[tuple[str, str]]:
+    """LABEL:ID lines or JSON objects with label and id; blanks and # comments skip."""
+    refs = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("{"):
+            record = strict_json(line)
+            refs.append((record["label"], record["id"]))
+        else:
+            refs.append(parse_ref(line))
+    return refs
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.command in STANDALONE:
+        return standalone(args)
 
     creating = args.command in {"load", "import", "note"}
     graph = KG(args.graph, create=creating)
@@ -319,6 +441,8 @@ def run(args, graph):
             max_bytes=args.max_bytes,
             blob_dir=args.blob_dir,
             dry_run=args.dry_run,
+            usage=args.usage,
+            memory_only=args.memory_only,
         )
         if not args.verbose:
             result = compact(
@@ -333,20 +457,49 @@ def run(args, graph):
             blobs=args.blobs,
             large_bytes=args.large_bytes,
             include_large=args.include_large,
+            usage=args.usage,
         )
         return output(result if args.verbose else compact(result))
     if args.command == "brief":
-        return output(graph.brief(args.label, per_label=args.per_label))
+        result = graph.brief(args.label, per_label=args.per_label)
+        graph.record_use(
+            hits=[
+                (label, item["id"])
+                for label, group in result["memory"].items()
+                for item in group["items"]
+            ]
+        )
+        return output(result)
     if args.command == "find":
+        result = graph.find(
+            args.text if args.text else args.keyword,
+            labels=args.label,
+            limit=args.limit,
+            require_all=args.all,
+            source=args.source,
+        )
+        graph.record_use(hits=[(hit["label"], hit["id"]) for hit in result])
+        return output(result)
+    if args.command == "compact":
         return output(
-            graph.find(
-                args.text if args.text else args.keyword,
-                labels=args.label,
-                limit=args.limit,
-                require_all=args.all,
-                source=args.source,
+            graph.compact(
+                target_bytes=args.target_bytes,
+                target_percent=args.target_percent,
+                apply=args.apply,
+                checkpoint=False
+                if args.no_checkpoint
+                else (args.checkpoint if args.checkpoint else True),
+                lossless_only=args.lossless_only,
             )
         )
+    if args.command == "usage":
+        report = graph.usage_report(top=args.top)
+        if args.dump:
+            report["dump"] = {
+                "path": str(args.dump),
+                "rows": write_records(args.dump, graph.usage_rows(), jsonl=True),
+            }
+        return output(report)
     if args.command == "note":
         props = {}
         for item in args.prop:
@@ -402,9 +555,24 @@ def run(args, graph):
             }
         )
     if args.command == "delete":
+        refs = (
+            read_refs(args.from_file)
+            if args.from_file
+            else [parse_ref(ref) for ref in args.node]
+        )
+        return output(compact(graph.delete(nodes=refs, dry_run=not args.apply)))
+    if args.command == "refresh":
         return output(
-            graph.delete(
-                nodes=[parse_ref(ref) for ref in args.node], dry_run=not args.apply
+            compact(
+                graph.refresh_source(
+                    args.source,
+                    read_records(args.nodes),
+                    read_records(args.edges) if args.edges else (),
+                    apply=args.apply,
+                    superseded_by=args.superseded_by,
+                    bookkeeping_rels=args.bookkeeping_rel,
+                    on_conflict=args.on_conflict,
+                )
             )
         )
     if args.command == "prune":
@@ -431,6 +599,7 @@ def run(args, graph):
         # `id` is the node's identity, not a stored property; `find` agrees.
         props = graph.props(args.label, args.id)
         props.pop("id", None)
+        graph.record_use(reads=[(args.label, args.id)])
         return output(
             {
                 "label": args.label,
@@ -441,15 +610,18 @@ def run(args, graph):
             }
         )
     if args.command == "neighbors":
-        return output(
-            graph.neighbors(
-                args.label, args.id, comma_list(args.rels), inbound=args.inbound
-            )
+        result = graph.neighbors(
+            args.label, args.id, comma_list(args.rels), inbound=args.inbound
         )
+        graph.record_use(hits=[(n["label"], n["id"]) for n in result if n["label"]])
+        return output(result)
     if args.command == "reach":
-        return output(
-            graph.reach(args.label, args.id, comma_list(args.rels), args.node_label)
+        result = graph.reach(
+            args.label, args.id, comma_list(args.rels), args.node_label
         )
+        if args.node_label:
+            graph.record_use(hits=[(args.node_label, ident) for ident in result])
+        return output(result)
     if args.command == "path":
         return output(
             graph.path(
@@ -462,31 +634,25 @@ def run(args, graph):
             )
         )
     if args.command == "search":
-        return output(
-            graph.search(
-                tokenize(args.text) if args.text else args.keyword,
-                limit=args.limit,
-                scope=args.scope,
-                require_all=bool(args.keyword) and not args.any,
-                min_score=args.min_score,
-                source=args.source,
-                candidate_limit=args.candidate_limit,
-                nodes=args.nodes,
-            )
-            if not args.compact
-            else compact_search(
-                graph.search(
-                    tokenize(args.text) if args.text else args.keyword,
-                    limit=args.limit,
-                    scope=args.scope,
-                    require_all=bool(args.keyword) and not args.any,
-                    min_score=args.min_score,
-                    source=args.source,
-                    candidate_limit=args.candidate_limit,
-                    nodes=args.nodes,
-                )
-            )
+        result = graph.search(
+            tokenize(args.text) if args.text else args.keyword,
+            limit=args.limit,
+            scope=args.scope,
+            require_all=bool(args.keyword) and not args.any,
+            min_score=args.min_score,
+            source=args.source,
+            candidate_limit=args.candidate_limit,
+            nodes=args.nodes,
         )
+        graph.record_use(
+            hits=[
+                ("Chunk", evidence["id"])
+                for item in result["results"]
+                for evidence in item["evidence"]
+            ]
+            + [(node["label"], node["id"]) for node in result["nodes"]]
+        )
+        return output(compact_search(result) if args.compact else result)
     if args.command == "query":
         sparql = args.sparql if args.sparql is not None else args.file.read_text()
         return output(graph.q(sparql))

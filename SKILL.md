@@ -83,14 +83,19 @@ A rejected merge lists every conflicting field at once. Preview a large or unfam
 |---|---|---|
 | Add or import knowledge | `load` or `import` | Merge by identity; reject conflicting values |
 | Add delta records | `load --merge` | Alias for the default; existing endpoints are allowed. `--edges` is optional: omit it for a node-only delta |
-| Explicitly refresh one corpus | `load --source NAME` | Remove source-owned records and affected edges, then load that source's replacement |
+| Bring one corpus up to date, keeping cited evidence | `refresh --source NAME --nodes fresh.jsonl --edges fresh-edges.jsonl [--apply]` | Stale versions are deleted when nothing cites them and marked `outdated` otherwise; returning versions lose the mark; previews without `--apply` |
+| Explicitly replace one corpus wholesale | `load --source NAME` | Remove source-owned records and every edge into them, evidence links included, then load the replacement |
 | Explicitly rebuild the whole graph | `load --replace` or `import --replace` | Replace all existing knowledge |
 | Explicitly retire a source | `drop-source --source NAME` | Remove owned records and affected edges |
 | Preview any of the above | `load --dry-run` or `import --dry-run` | Report created/updated counts and every conflict; write nothing |
-| Remove specific nodes | `delete --node LABEL:ID [--apply]` | Remove nodes and incident edges; previews without `--apply` |
+| Remove specific nodes | `delete --node LABEL:ID [--apply]` or `delete --from FILE [--apply]` | Remove nodes and incident edges in one transaction; FILE holds `LABEL:ID` lines or JSON node records; previews without `--apply` |
+| Compare lineages before merging | `diff --file A --file B` or `diff --graph NAME --file B` | Counts only in A/B or differing, memory notes unique to each side, paths with several current versions |
+| Merge a fork's lessons only | `import --memory-only` | Memory notes plus the nodes their edges reach; no source versions come back |
 | Clean stale ingester mentions | `prune [--apply]` | Drop mention edges the current ingester would not create, then edgeless `WebResource`/`EnvironmentVariable` nodes |
 
-Replacement, source refresh, and retirement discard evidence. Use them only when that scope is authorized. A request to import or add material authorizes the normal merge. A source refresh can remove links from other findings to retired evidence, while leaving those findings present. Recheck their support after refreshing. See [operations](references/operations.md) for ownership rules and recovery.
+Replacement, wholesale source replacement, and retirement discard evidence. Use them only when that scope is authorized. A request to import or add material authorizes the normal merge. To update a source, ingest it fresh into its own directory and use `refresh`: preview, `--apply`, then rerun the preview, which must report nothing stale, created or updated, with `evidence_edges_after` equal to `evidence_edges_before`. Pass `--superseded-by COMMIT` to record what replaced the marked versions, and `--bookkeeping-rel REL` for relations like a snapshot's `INCLUDES` that are not evidence. See [operations](references/operations.md) for ownership rules, refresh details, and recovery.
+
+If a graph refuses to open with "older than its RDF index", its SQLite file lost committed writes. Nothing was changed. Do not delete files to get past it: move `rdf/NAME.oxi` and `content/NAME.sqlite3*` aside and import the newest exported package.
 
 ## Query and answer
 
@@ -212,9 +217,29 @@ For a broad question, such as "is there something similar to X in the ecosystem"
 
 Search includes up to eight evidence chunks, preserving their metadata. Snippets focus on a matching span and report character offsets; line ranges describe the whole chunk, from its first to its last non-blank line (see "Chunk text and locators"). Use `show --label Chunk --id ...` to read the full text. Inspect `evidence_truncated` and `capped_terms`; raise `--candidate-limit` or narrow the source if candidate capping could hide relevant evidence.
 
+## Usage and size
+
+The graph counts its own use: `search`, `find`, `brief`, `neighbors` and `reach` count the nodes they return as hits, and `show` counts a read. Counts are buffered and written once per command, about 25 bytes per used node; `KG_USAGE=0` turns it off. Counters halve after `max(10,000, 10 × nodes)` events, so they favour recent use. They travel in packages and merge by maximum, so re-importing never double counts.
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" usage project --top 10
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" usage project --dump usage.jsonl
+```
+
+`usage` shows what was used, cold chunk text per source, the largest documents nobody touched, and the hottest nodes. `--dump` writes every counter for your own frequency analysis or sampling.
+
+**Reduce size only when the user explicitly asks for it.** A large graph, an export, or tidying up is not a request. Then preview first and show the user the plan:
+
+```bash
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" compact project --target-percent 20
+.venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" compact project --target-percent 20 --apply
+```
+
+Level 0 is lossless (`VACUUM`, index merge). Level 1 evicts the text of the coldest chunks and keeps a stub with digest and locator; re-ingesting the source restores it. Level 2 deletes cold `outdated` versions nothing cites. Memory notes, cited evidence, and anything read in the last 30 days are never touched. A checkpoint package is exported before the first lossy step; import it to undo. Use `--lossless-only` when the user wants no loss. `usage_days` in the report says how many days of counters back the ranking; with only a few, cold mostly means large, so tell the user. Details are in [operations](references/operations.md#usage-counters-and-compaction).
+
 ## Portable graphs: `.graph-skill-db`
 
-A `.graph-skill-db` is a ZIP container holding `manifest.json`, `nodes.jsonl`, `edges.jsonl`, and optionally a content-addressed object store of raw artifact bytes under `blobs/<sha256>`. The records are neutral JSON and chunk text, with no executable extractor or binary database.
+A `.graph-skill-db` is a ZIP container holding `manifest.json`, `nodes.jsonl`, `edges.jsonl`, optionally the usage counters in `usage.jsonl`, and optionally a content-addressed object store of raw artifact bytes under `blobs/<sha256>`. The records are neutral JSON and chunk text, with no executable extractor or binary database. `export --no-usage` leaves the counters out and `import --no-usage` ignores them.
 
 ```bash
 .venv-kg/bin/python "$SKILL_ROOT/scripts/kg.py" export project --out handover.graph-skill-db
@@ -250,7 +275,7 @@ Import verifies every blob before any record changes and keeps the bytes in `KG_
 
 Inspect the validated manifest and summarize incoming sources/counts. Then merge into the existing graph, or create the named graph if none exists. Keep adding knowledge after import and export the accumulated result for handover. Reimporting unchanged records does not duplicate them.
 
-Exports use format version 3 with member byte counts and SHA-256 checksums, and a digest for every blob. Version 2 packages carry records only and stay readable; version 1 draft packages are accepted without checksum assurance; their earlier loss of JSON types cannot be reconstructed. Import validates the whole package before modifying records. Records are read as data and no member is ever executed; blobs are written to disk only when `--blob-dir` asks for it. Blobs are verified against their own name before extraction and land under digest-derived paths, so no member can escape the target directory. The default uncompressed package limit is 512 MiB and now covers blobs too, configurable with `--max-bytes`; see the complete contract in [operations](references/operations.md). Checksums detect inconsistency, not authorship or trustworthiness.
+Exports use format version 4 when they carry usage counters and version 3 otherwise, with member byte counts and SHA-256 checksums, and a digest for every blob. Version 2 packages carry records only and stay readable; version 1 draft packages are accepted without checksum assurance; their earlier loss of JSON types cannot be reconstructed. Import validates the whole package before modifying records. Records are read as data and no member is ever executed; blobs are written to disk only when `--blob-dir` asks for it. Blobs are verified against their own name before extraction and land under digest-derived paths, so no member can escape the target directory. The default uncompressed package limit is 512 MiB and now covers blobs too, configurable with `--max-bytes`; see the complete contract in [operations](references/operations.md). Checksums detect inconsistency, not authorship or trustworthiness.
 
 ## Material requiring other capabilities
 
