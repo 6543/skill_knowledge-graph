@@ -101,6 +101,8 @@ Chunk text is stored once, in the table its full-text index reads; the `Chunk` r
 
 Besides chunk text, SQLite keeps a full-text index over every non-Chunk node: label, ID, and all string values in its properties (each capped at 4,000 characters). Writes, source refresh, deletion, and replacement keep it in step; a graph written before the index existed builds it on first open. `find` and the `nodes` part of `search` rank it by term coverage, then BM25. Ingester labels are excluded unless requested, because they outnumber knowledge nodes by orders of magnitude.
 
+Triggers keep the chunk and node full-text indexes in step with single-row writes. A batch of at least 1,000 nodes that is also more than a quarter of the graph (a fresh import, a large source) drops them inside its transaction and rebuilds the indexes once at the end, about four times cheaper per chunk. A failed, conflicting or dry-run batch rolls back the dropped triggers with everything else.
+
 `brief` reads records directly. Its default labels are the memory labels in [modeling](modeling.md#session-memory); a node's date is the first ISO date among `observed`, `observed_at`, `found`, `date`, `updated`, `created`, else a date inside its `source` name.
 
 ## Package contract

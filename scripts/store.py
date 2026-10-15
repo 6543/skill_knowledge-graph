@@ -23,6 +23,9 @@ import pyoxigraph as ox
 DEFAULT_NS = os.environ.get("KG_NAMESPACE", "urn:kg:")
 RDF_TYPE = ox.NamedNode("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 XSD = "http://www.w3.org/2001/XMLSchema#"
+XSD_BOOLEAN = ox.NamedNode(XSD + "boolean")
+XSD_INTEGER = ox.NamedNode(XSD + "integer")
+XSD_DOUBLE = ox.NamedNode(XSD + "double")
 SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 WORD = re.compile(r"[^\W_][\w.:-]*", re.UNICODE)
 JSON_TYPE = ox.NamedNode("urn:graph-skill-db:json")
@@ -61,6 +64,23 @@ def canonical(value):
         allow_nan=False,
         separators=(",", ":"),
     )
+
+
+def same_json(a, b) -> bool:
+    """`canonical(a) == canonical(b)` for JSON values, without serializing.
+
+    Types must match exactly (True is not 1, 1 is not 1.0) and floats compare by
+    their JSON text (-0.0 is not 0.0), as they do in canonical output.
+    """
+    if type(a) is not type(b):
+        return False
+    if type(a) is dict:
+        return a.keys() == b.keys() and all(same_json(a[k], b[k]) for k in a)
+    if type(a) is list:
+        return len(a) == len(b) and all(map(same_json, a, b))
+    if type(a) is float:
+        return repr(a) == repr(b)
+    return a == b
 
 
 def strict_json(value):
@@ -188,6 +208,62 @@ STOP_WORDS = {
 # applying the change record by record. Measured on a mixed prose and code corpus.
 RDF_DELTA_RATIO = 4
 PAGE_SIZE = 16384
+
+
+# Triggers keep the full-text indexes in step with single-row writes. A bulk
+# load drops them inside its transaction and rebuilds the indexes once instead.
+CHUNK_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_after_insert AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, heading, text)
+        VALUES (new.rowid, new.heading, new.text);
+        INSERT INTO locations_fts(rowid, loc) VALUES (new.rowid, new.loc);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_after_delete AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
+        VALUES ('delete', old.rowid, old.heading, old.text);
+        DELETE FROM locations_fts WHERE rowid = old.rowid;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_after_update AFTER UPDATE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
+        VALUES ('delete', old.rowid, old.heading, old.text);
+        INSERT INTO chunks_fts(rowid, heading, text)
+        VALUES (new.rowid, new.heading, new.text);
+        DELETE FROM locations_fts WHERE rowid = old.rowid;
+        INSERT INTO locations_fts(rowid, loc) VALUES (new.rowid, new.loc);
+    END;
+    """,
+)
+
+NODE_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS node_index_ai AFTER INSERT ON node_index BEGIN
+        INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS node_index_ad AFTER DELETE ON node_index BEGIN
+        INSERT INTO node_fts(node_fts, rowid, name, text)
+        VALUES ('delete', old.rowid, old.name, old.text);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS node_index_au AFTER UPDATE ON node_index BEGIN
+        INSERT INTO node_fts(node_fts, rowid, name, text)
+        VALUES ('delete', old.rowid, old.name, old.text);
+        INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
+    END;
+    """,
+)
+FTS_TRIGGER_NAMES = tuple(
+    re.search(r"EXISTS (\w+)", sql).group(1) for sql in CHUNK_TRIGGERS + NODE_TRIGGERS
+)
+# Below this many incoming nodes, per-row trigger indexing is cheap enough.
+BULK_INDEX_MIN = 1000
 
 
 class GraphValidationError(ValueError):
@@ -463,7 +539,14 @@ def write_records(path: str | Path, records, jsonl: bool | None = None) -> int:
     return count
 
 
+_NAMES_OK: set[str] = set()
+
+
 def _check_name(kind: str, value) -> str:
+    # A batch repeats the same few labels, relations and property names many
+    # thousands of times; remembering the valid ones skips the regex.
+    if type(value) is str and value in _NAMES_OK:
+        return value
     if (
         not isinstance(value, str)
         or not SAFE_NAME.fullmatch(value)
@@ -472,6 +555,8 @@ def _check_name(kind: str, value) -> str:
         raise GraphValidationError(
             f"invalid {kind} {value!r}; use letters, digits, and underscores"
         )
+    if len(_NAMES_OK) < 65536:
+        _NAMES_OK.add(value)
     return value
 
 
@@ -488,17 +573,20 @@ def _check_props(owner: str, props) -> dict:
             )
 
     def check(value):
-        if value is None or type(value) in (str, bool, int):
-            if isinstance(value, str):
-                value.encode("utf-8")
+        kind = type(value)
+        if kind is str:
+            value.encode("utf-8")  # rejects lone surrogates
             return
-        if type(value) is float and math.isfinite(value):
+        if value is None or kind is bool or kind is int:
             return
-        if isinstance(value, list):
+        if kind is float:
+            if math.isfinite(value):
+                return
+        elif isinstance(value, list):
             for item in value:
                 check(item)
             return
-        if isinstance(value, dict) and all(isinstance(k, str) for k in value):
+        elif isinstance(value, dict) and all(isinstance(k, str) for k in value):
             for key, item in value.items():
                 check(key)
                 check(item)
@@ -561,15 +649,14 @@ def validate_graph(nodes, edges, resolve=None) -> dict:
                 and props["end_line"] < props["start_line"]
             ):
                 raise GraphValidationError(f"Chunk {identifier}: inverted line range")
-        digest = json.dumps(
-            props, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
         key = (label, identifier)
-        if key in known and known[key] != digest:
+        # Serialize only on a repeated key: almost every node is unique, and a
+        # JSON dump per node was a large share of the validation time.
+        if key in known and not same_json(known[key], props):
             raise GraphValidationError(
                 f"conflicting duplicate node {label}:{identifier}"
             )
-        known[key] = digest
+        known[key] = props
         node_count += 1
 
     edge_count = 0
@@ -593,11 +680,10 @@ def validate_graph(nodes, edges, resolve=None) -> dict:
         identity = tuple(
             edge[k] for k in ("rel", "src_label", "src", "dst_label", "dst")
         )
-        digest = canonical(_check_props(f"edge {index}", edge.get("props")))
-        if identity in edge_seen and edge_seen[identity] != digest:
+        props = _check_props(f"edge {index}", edge.get("props"))
+        if identity in edge_seen and not same_json(edge_seen[identity], props):
             raise GraphValidationError(f"conflicting duplicate edge {identity}")
-        edge_seen[identity] = digest
-        _check_props(f"edge {rel}", edge.get("props"))
+        edge_seen[identity] = props
         for role, endpoint in (
             ("source", (src_label, edge.get("src"))),
             ("destination", (dst_label, edge.get("dst"))),
@@ -625,21 +711,17 @@ def literal(value):
     if value is None or isinstance(value, (list, dict)):
         return ox.Literal(canonical(value), datatype=JSON_TYPE)
     if isinstance(value, bool):
-        return ox.Literal(
-            "true" if value else "false", datatype=ox.NamedNode(XSD + "boolean")
-        )
+        return ox.Literal("true" if value else "false", datatype=XSD_BOOLEAN)
     if isinstance(value, int):
-        return ox.Literal(str(value), datatype=ox.NamedNode(XSD + "integer"))
+        return ox.Literal(str(value), datatype=XSD_INTEGER)
     if isinstance(value, float):
-        return ox.Literal(repr(value), datatype=ox.NamedNode(XSD + "double"))
-    if isinstance(value, (list, dict)):
-        return ox.Literal(json.dumps(value, sort_keys=True, ensure_ascii=False))
+        return ox.Literal(repr(value), datatype=XSD_DOUBLE)
     return ox.Literal(str(value))
 
 
 def _term_value(term):
     if isinstance(term, ox.Literal) and term.datatype == JSON_TYPE:
-        return strict_json(term.value)
+        return json.loads(term.value)
     if term is None:
         return None
     value = term.value
@@ -870,16 +952,12 @@ def diff_records(a_nodes, a_edges, b_nodes, b_edges, top: int = 20) -> dict:
         "nodes": {
             "only_a": counts(k for k in an if k not in bn),
             "only_b": counts(k for k in bn if k not in an),
-            "differ": counts(
-                k for k in an if k in bn and canonical(an[k]) != canonical(bn[k])
-            ),
+            "differ": counts(k for k in an if k in bn and not same_json(an[k], bn[k])),
         },
         "edges": {
             "only_a": counts(k for k in ae if k not in be),
             "only_b": counts(k for k in be if k not in ae),
-            "differ": counts(
-                k for k in ae if k in be and canonical(ae[k]) != canonical(be[k])
-            ),
+            "differ": counts(k for k in ae if k in be and not same_json(ae[k], be[k])),
         },
         "memory": {
             "only_a": memory(an, bn),
@@ -887,9 +965,7 @@ def diff_records(a_nodes, a_edges, b_nodes, b_edges, top: int = 20) -> dict:
             "conflicting": [
                 {"label": k[0], "id": k[1]}
                 for k in sorted(an)
-                if k[0] in MEMORY_LABELS
-                and k in bn
-                and canonical(an[k]) != canonical(bn[k])
+                if k[0] in MEMORY_LABELS and k in bn and not same_json(an[k], bn[k])
             ][:top],
         },
         "current_versions": {
@@ -901,6 +977,10 @@ def diff_records(a_nodes, a_edges, b_nodes, b_edges, top: int = 20) -> dict:
             ],
         },
     }
+
+
+def _load_mode(replace: bool, source) -> str:
+    return "replace" if replace else "merge" if source is None else "replace_source"
 
 
 class _DryRun(Exception):
@@ -932,6 +1012,7 @@ class KG:
         self.content = None
         self.track_usage = os.environ.get("KG_USAGE", "1") != "0"
         self._usage_buffer: dict[int, list[int]] = {}
+        self._iri_cache: dict[tuple[str, str], ox.NamedNode] = {}
         try:
             stamp = self._state_stamp()
             if stamp is not None and not self.content_path.exists():
@@ -1157,7 +1238,7 @@ class KG:
     def _node_keys(self) -> dict[int, tuple[str, str]]:
         keys = {}
         for (key,) in self.content.execute("SELECT key FROM records WHERE kind='node'"):
-            label, identifier = strict_json(key)
+            label, identifier = json.loads(key)
             keys[usage_key(label, identifier)] = (label, identifier)
         return keys
 
@@ -1468,7 +1549,7 @@ class KG:
                 if mark:
                     props.update(marks)
                 current_record = {**previous, "props": props}
-                if canonical(current_record) != canonical(previous):
+                if not same_json(current_record, previous):
                     self._put("node", current_record)
                     changed.append(("node", previous, current_record))
             return removed, changed
@@ -1645,7 +1726,7 @@ class KG:
         for row in self.content.execute(
             "SELECT value FROM records WHERE kind=? ORDER BY key", (kind,)
         ):
-            yield strict_json(row[0])
+            yield json.loads(row[0])
 
     def _lossless_compaction(self) -> None:
         with self.content:
@@ -1924,7 +2005,7 @@ class KG:
                 "AND json_type(value, '$.props.text') = 'text'"
             ).fetchall()
             for key, value in rows:
-                record = strict_json(value)
+                record = json.loads(value)
                 indexed = self.content.execute(
                     "SELECT text FROM chunks WHERE node_iri=?",
                     (self.node_iri("Chunk", record["id"]).value,),
@@ -1939,8 +2020,8 @@ class KG:
             self._set_meta("chunk_text_store", "chunks")
         return bool(stripped)
 
-    def _put(self, kind, record):
-        key = self._key(kind, record)
+    def _put(self, kind, record, key=None):
+        key = key or self._key(kind, record)
         self.content.execute(
             "INSERT OR REPLACE INTO records VALUES (?,?,?)",
             (kind, key, canonical(self._stored_form(kind, record))),
@@ -1984,50 +2065,52 @@ class KG:
                 name, text, content='node_index', content_rowid='rowid',
                 tokenize='unicode61'
             );
-            CREATE TRIGGER IF NOT EXISTS node_index_ai AFTER INSERT ON node_index BEGIN
-                INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS node_index_ad AFTER DELETE ON node_index BEGIN
-                INSERT INTO node_fts(node_fts, rowid, name, text)
-                    VALUES ('delete', old.rowid, old.name, old.text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS node_index_au AFTER UPDATE ON node_index BEGIN
-                INSERT INTO node_fts(node_fts, rowid, name, text)
-                    VALUES ('delete', old.rowid, old.name, old.text);
-                INSERT INTO node_fts(rowid, name, text) VALUES (new.rowid, new.name, new.text);
-            END;
             """
+            + "".join(NODE_TRIGGERS)
         )
         if not existed:
             with self.content:
                 for row in self.content.execute(
                     "SELECT key, value FROM records WHERE kind='node'"
                 ).fetchall():
-                    self._index_node(row[0], strict_json(row[1]))
+                    self._index_node(row[0], json.loads(row[1]))
         self.content.commit()
 
     def _index_node(self, key, record):
-        self.content.execute("DELETE FROM node_index WHERE key=?", (key,))
+        # The label is part of the key, so a Chunk key never has an index row.
         if record["label"] == "Chunk":
             return
         name = re.sub(r"[^\w]+", " ", f"{record['label']} {record['id']}").strip()
         text = "\n".join(_strings(record.get("props") or {}))
+        # One upsert instead of DELETE + INSERT: the update trigger keeps the
+        # full-text index in step, and a DELETE probe per node was slow.
         self.content.execute(
-            "INSERT INTO node_index(key, label, id, name, text) VALUES (?,?,?,?,?)",
+            "INSERT INTO node_index(key, label, id, name, text) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET name=excluded.name, text=excluded.text",
             (key, record["label"], record["id"], name, text),
+        )
+
+    def _label_rows(self, label: str, column: str):
+        """`column` of every node with this label, in key order.
+
+        A node key is the canonical JSON of [label, id], and labels are safe
+        names, so every key of a label starts with `["Label",`: a primary-key
+        range scan instead of parsing the JSON of every record.
+        """
+        return self.content.execute(
+            f"SELECT {column} FROM records WHERE kind='node' AND key > ? AND key < ? "
+            "ORDER BY key",
+            (f'["{label}",', f'["{label}"-'),
         )
 
     def _record(self, kind, key):
         row = self.content.execute(
             "SELECT value FROM records WHERE kind=? AND key=?", (kind, canonical(key))
         ).fetchone()
-        return self._hydrate(strict_json(row[0])) if row else None
+        return self._hydrate(json.loads(row[0])) if row else None
 
     def _records(self, kind):
-        for row in self.content.execute(
-            "SELECT value FROM records WHERE kind=? ORDER BY key", (kind,)
-        ):
-            yield self._hydrate(strict_json(row[0]))
+        return map(self._hydrate, self._records_raw(kind))
 
     def _ensure_rdf(self):
         revision = self._meta("revision")
@@ -2042,22 +2125,27 @@ class KG:
         with self.content:
             self._set_meta("rdf_revision", revision)
 
+    def _term(self, name: str) -> ox.NamedNode:
+        """`ns + name` as an IRI; the few distinct names repeat on every record."""
+        term = self._iri_cache.get(name)
+        if term is None:
+            term = self._iri_cache[name] = ox.NamedNode(self.ns + name)
+        return term
+
     def _record_quads(self, kind, record):
         """The quads one neutral record contributes. Distinct records never share a
         quad, which is what makes removing a record's quads safe on its own."""
         if kind == "node":
             subject = self.node_iri(record["label"], record["id"])
-            yield ox.Quad(subject, RDF_TYPE, ox.NamedNode(self.ns + record["label"]))
-            yield ox.Quad(
-                subject, ox.NamedNode(self.ns + "id"), ox.Literal(record["id"])
-            )
+            yield ox.Quad(subject, RDF_TYPE, self._term(record["label"]))
+            yield ox.Quad(subject, self._term("id"), ox.Literal(record["id"]))
             for prop, value in record.get("props", {}).items():
                 if record["label"] == "Chunk" and prop == "text":
                     continue
-                yield ox.Quad(subject, ox.NamedNode(self.ns + prop), literal(value))
+                yield ox.Quad(subject, self._term(prop), literal(value))
             return
         subject = self.node_iri(record["src_label"], record["src"])
-        predicate = ox.NamedNode(self.ns + record["rel"])
+        predicate = self._term(record["rel"])
         obj = self.node_iri(record["dst_label"], record["dst"])
         yield ox.Quad(subject, predicate, obj)
         if record.get("props"):
@@ -2067,15 +2155,14 @@ class KG:
                 ("_predicate", predicate),
                 ("_object", obj),
             ):
-                yield ox.Quad(fact, ox.NamedNode(self.ns + key), value)
+                yield ox.Quad(fact, self._term(key), value)
             for prop, value in record["props"].items():
-                yield ox.Quad(
-                    fact, ox.NamedNode(self.ns + "_edge_prop_" + prop), literal(value)
-                )
+                yield ox.Quad(fact, self._term("_edge_prop_" + prop), literal(value))
 
     def _quads(self):
+        # Chunk text never becomes a quad, so the rebuild skips fetching it.
         for kind in ("node", "edge"):
-            for record in self._records(kind):
+            for record in self._records_raw(kind):
                 yield from self._record_quads(kind, record)
 
     def _apply_rdf_delta(self, base_revision, removed, changed):
@@ -2158,28 +2245,7 @@ class KG:
         # Triggers keep both indexes in step with single-row writes. Without them
         # every merge had to rebuild the whole index, which turns "add one fact to
         # the graph" into work proportional to the entire corpus.
-        self.content.executescript(
-            """
-            CREATE TRIGGER IF NOT EXISTS chunks_after_insert AFTER INSERT ON chunks BEGIN
-                INSERT INTO chunks_fts(rowid, heading, text)
-                    VALUES (new.rowid, new.heading, new.text);
-                INSERT INTO locations_fts(rowid, loc) VALUES (new.rowid, new.loc);
-            END;
-            CREATE TRIGGER IF NOT EXISTS chunks_after_delete AFTER DELETE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
-                    VALUES ('delete', old.rowid, old.heading, old.text);
-                DELETE FROM locations_fts WHERE rowid = old.rowid;
-            END;
-            CREATE TRIGGER IF NOT EXISTS chunks_after_update AFTER UPDATE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
-                    VALUES ('delete', old.rowid, old.heading, old.text);
-                INSERT INTO chunks_fts(rowid, heading, text)
-                    VALUES (new.rowid, new.heading, new.text);
-                DELETE FROM locations_fts WHERE rowid = old.rowid;
-                INSERT INTO locations_fts(rowid, loc) VALUES (new.rowid, new.loc);
-            END;
-            """
-        )
+        self.content.executescript("".join(CHUNK_TRIGGERS))
         self.content.commit()
 
     def _migrate_content(self) -> None:
@@ -2213,7 +2279,18 @@ class KG:
             )
 
     def node_iri(self, label: str, identifier: str) -> ox.NamedNode:
-        return ox.NamedNode(f"{self.ns}{label}/{quote(str(identifier), safe='')}")
+        # Edges name their endpoints again and again; percent-encoding each
+        # occurrence anew was a visible share of an import.
+        cache = self._iri_cache
+        key = (label, identifier)
+        iri = cache.get(key)
+        if iri is None:
+            if len(cache) >= 1 << 18:
+                cache.clear()
+            iri = cache[key] = ox.NamedNode(
+                f"{self.ns}{label}/{quote(str(identifier), safe='')}"
+            )
+        return iri
 
     def edge_iri(self, edge: dict) -> ox.NamedNode:
         identity = {
@@ -2232,7 +2309,13 @@ class KG:
         return unquote(value.rsplit("/", 1)[-1])
 
     def exists(self, label: str, identifier: str) -> bool:
-        return self._record("node", [label, identifier]) is not None
+        return (
+            self.content.execute(
+                "SELECT 1 FROM records WHERE kind='node' AND key=?",
+                (canonical([label, identifier]),),
+            ).fetchone()
+            is not None
+        )
 
     # ------------------------------------------------------------------- write
     @staticmethod
@@ -2250,7 +2333,8 @@ class KG:
     def _drop_source(self, source):
         removed = set()
         removed_records = []
-        for node in list(self._records("node")):
+        # Removed records only feed the RDF delta, which never needs chunk text.
+        for node in list(self._records_raw("node")):
             if self._owners(node) == {source} or (
                 node["label"] == "Source" and node["id"] == source
             ):
@@ -2258,7 +2342,7 @@ class KG:
                 removed_records.append(("node", node))
                 self._unput("node", node)
         edges_removed = facts_removed = 0
-        for edge in list(self._records("edge")):
+        for edge in list(self._records_raw("edge")):
             if (
                 (edge["src_label"], edge["src"]) in removed
                 or (edge["dst_label"], edge["dst"]) in removed
@@ -2316,10 +2400,16 @@ class KG:
         if source is not None and (not isinstance(source, str) or not source):
             raise GraphValidationError("source must be a non-empty string")
         nodes, edges = list(nodes), list(edges)
-        # Validate all field types before destructive operations. Full endpoint
-        # validation follows the source deletion inside the same rollbackable transaction.
-        validate_graph(nodes, edges, resolve=self.exists if not replace else None)
-        nodes = strict_json(canonical(nodes))
+        # Validate all field types before destructive operations. When a source
+        # deletion or `_prepare` changes the store first, endpoints are checked
+        # again inside the same rollbackable transaction.
+        validation = validate_graph(
+            nodes, edges, resolve=self.exists if not replace else None
+        )
+        # Private copies, normalized once. Canonical output has no duplicate
+        # keys or non-finite numbers, so the fast parser is enough here.
+        nodes = json.loads(canonical(nodes))
+        edges = json.loads(canonical(edges))
         for node in nodes:
             props = node.get("props") or {}
             if node["label"] == "Chunk" and "text" in props:
@@ -2344,7 +2434,14 @@ class KG:
         base_revision = self._meta("revision")
         try:
             report = self._load_transaction(
-                nodes, edges, replace, source, on_conflict, dry_run, _prepare
+                nodes,
+                edges,
+                replace,
+                source,
+                on_conflict,
+                dry_run,
+                _prepare,
+                validation,
             )
         except _DryRun as preview:
             return preview.args[0]
@@ -2365,11 +2462,7 @@ class KG:
         self._compact_after(changed)
         return {
             **validation,
-            "mode": "replace"
-            if replace
-            else "replace_source"
-            if source is not None
-            else "merge",
+            "mode": _load_mode(replace, source),
             "created": created,
             "updated": updated,
             "triples": self._triple_count(),
@@ -2382,7 +2475,15 @@ class KG:
         }
 
     def _load_transaction(
-        self, nodes, edges, replace, source, on_conflict, dry_run, prepare=None
+        self,
+        nodes,
+        edges,
+        replace,
+        source,
+        on_conflict,
+        dry_run,
+        prepare=None,
+        validation=None,
     ):
         written = changed = created = updated = 0
         removed_records = []
@@ -2407,18 +2508,20 @@ class KG:
                 removed_records = [*removed_records, *extra_removed]
                 changed_records.extend(extra_changed)
                 changed += len(extra_removed) + len(extra_changed)
-            validation = validate_graph(
-                nodes, edges, resolve=self.exists if not replace else None
-            )
+            if validation is None or source is not None or prepare is not None:
+                validation = validate_graph(
+                    nodes, edges, resolve=self.exists if not replace else None
+                )
+            bulk = self._bulk_index_begin(len(nodes), replace)
+            changed_before = changed
             conflicts = []
             for kind, records in (("node", nodes), ("edge", edges)):
                 for incoming in records:
-                    incoming = strict_json(canonical(incoming))
                     key = self._key(kind, incoming)
                     row = self.content.execute(
                         "SELECT value FROM records WHERE kind=? AND key=?", (kind, key)
                     ).fetchone()
-                    previous = self._hydrate(strict_json(row[0])) if row else None
+                    previous = self._hydrate(json.loads(row[0])) if row else None
                     props = dict(previous.get("props", {})) if previous else {}
                     for prop, value in (incoming.get("props") or {}).items():
                         merged = _merge_set_prop(
@@ -2429,7 +2532,7 @@ class KG:
                             continue
                         if (
                             prop in props
-                            and canonical(props[prop]) != canonical(value)
+                            and not same_json(props[prop], value)
                             and on_conflict == "error"
                         ):
                             # Collect every conflict before aborting: fixing a
@@ -2447,11 +2550,11 @@ class KG:
                         props.pop("evicted", None)
                     if props or kind == "node" or "props" in incoming:
                         incoming["props"] = props
-                    if previous and canonical(previous) == canonical(incoming):
+                    if previous and same_json(previous, incoming):
                         continue
                     created += previous is None
                     updated += previous is not None
-                    self._put(kind, incoming)
+                    self._put(kind, incoming, key)
                     changed_records.append((kind, previous, incoming))
                     changed += 1
                     if kind == "node" and incoming["label"] == "Chunk":
@@ -2462,11 +2565,7 @@ class KG:
                     {
                         **validation,
                         "dry_run": True,
-                        "mode": "replace"
-                        if replace
-                        else "replace_source"
-                        if source is not None
-                        else "merge",
+                        "mode": _load_mode(replace, source),
                         "created": created,
                         "updated": updated,
                         "removed": len(removed_records),
@@ -2484,6 +2583,8 @@ class KG:
                 )
             if conflicts:
                 raise GraphValidationError(conflict_message(conflicts))
+            if bulk:
+                self._bulk_index_end(rebuild=changed > changed_before)
             if changed:
                 self._set_meta("revision", int(base_revision) + 1)
         return (
@@ -2495,6 +2596,43 @@ class KG:
             changed_records,
             validation,
         )
+
+    def _bulk_index_begin(self, incoming: int, replace: bool) -> bool:
+        """Drop the full-text triggers for a large write; see `_bulk_index_end`.
+
+        Indexing row by row costs about four times a single rebuild per chunk,
+        so a batch that is large next to the graph rebuilds once instead. The
+        DROP runs inside the caller's transaction: a rollback, a conflict or a
+        dry run brings the triggers back with everything else.
+        """
+        if not replace:
+            if incoming < BULK_INDEX_MIN:
+                return False
+            existing = self.content.execute(
+                "SELECT COUNT(*) FROM records WHERE kind='node'"
+            ).fetchone()[0]
+            if incoming * RDF_DELTA_RATIO <= existing:
+                return False
+        if not self.content.in_transaction:
+            self.content.execute("BEGIN")
+        for name in FTS_TRIGGER_NAMES:
+            self.content.execute(f"DROP TRIGGER IF EXISTS {name}")
+        return True
+
+    def _bulk_index_end(self, rebuild: bool = True) -> None:
+        """Rebuild all full-text indexes from their tables, then restore triggers.
+
+        Without writes since `_bulk_index_begin` the indexes are still current.
+        """
+        if rebuild:
+            self.content.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+            self.content.execute("DELETE FROM locations_fts")
+            self.content.execute(
+                "INSERT INTO locations_fts(rowid, loc) SELECT rowid, loc FROM chunks"
+            )
+            self.content.execute("INSERT INTO node_fts(node_fts) VALUES('rebuild')")
+        for sql in CHUNK_TRIGGERS + NODE_TRIGGERS:
+            self.content.execute(sql)
 
     def _write_chunk(self, node):
         props = node.get("props", {})
@@ -3355,12 +3493,8 @@ class KG:
         for label in wanted:
             _check_name("label", label)
             items = []
-            for row in self.content.execute(
-                "SELECT value FROM records WHERE kind='node' "
-                "AND json_extract(value, '$.label') = ?",
-                (label,),
-            ):
-                record = self._hydrate(strict_json(row[0]))
+            for (value,) in self._label_rows(label, "value"):
+                record = self._hydrate(json.loads(value))
                 props = record.get("props") or {}
                 items.append(
                     {
@@ -3407,16 +3541,12 @@ class KG:
             _check_name("label", label)
         linked = set()
         for row in self.content.execute("SELECT value FROM records WHERE kind='edge'"):
-            edge = strict_json(row[0])
+            edge = json.loads(row[0])
             linked.add((edge["src_label"], edge["src"]))
             linked.add((edge["dst_label"], edge["dst"]))
         found = []
         for label in labels:
-            for row in self.content.execute(
-                "SELECT json_extract(value, '$.id') FROM records WHERE kind='node' "
-                "AND json_extract(value, '$.label') = ? ORDER BY key",
-                (label,),
-            ):
+            for row in self._label_rows(label, "json_extract(value, '$.id')"):
                 if (label, row[0]) not in linked:
                     found.append((label, row[0]))
         return found
@@ -3442,7 +3572,7 @@ class KG:
         for row in self.content.execute(
             "SELECT key, value FROM records WHERE kind='edge'"
         ).fetchall():
-            edge = strict_json(row[1])
+            edge = json.loads(row[1])
             if (
                 row[0] in edge_keys
                 or (edge["src_label"], edge["src"]) in targets
@@ -3484,17 +3614,22 @@ class KG:
     def sources(self) -> list[str]:
         """Source names exactly as a package manifest lists them: Source node
         IDs plus every node's string `source`/`repository` owner tag."""
-        rows = self.content.execute(
-            """SELECT json_extract(value, '$.id') FROM records
-               WHERE kind='node' AND json_extract(value, '$.label') = 'Source'
-               UNION
-               SELECT json_extract(value, '$.props.source') FROM records
-               WHERE kind='node' AND json_type(value, '$.props.source') = 'text'
-               UNION
-               SELECT json_extract(value, '$.props.repository') FROM records
-               WHERE kind='node' AND json_type(value, '$.props.repository') = 'text'"""
+        names = {
+            name
+            for row in self.content.execute(
+                """SELECT
+                   CASE WHEN json_type(value, '$.props.source') = 'text'
+                        THEN json_extract(value, '$.props.source') END,
+                   CASE WHEN json_type(value, '$.props.repository') = 'text'
+                        THEN json_extract(value, '$.props.repository') END
+                   FROM records WHERE kind='node'"""
+            )
+            for name in row
+        }
+        names.update(
+            row[0] for row in self._label_rows("Source", "json_extract(value, '$.id')")
         )
-        return sorted({row[0] for row in rows if row[0]})
+        return sorted(name for name in names if name)
 
     def stats(self) -> dict:
         self._ensure_rdf()
