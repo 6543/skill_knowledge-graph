@@ -2761,6 +2761,34 @@ class KG:
     def export_records(self):
         return list(self._records("node")), list(self._records("edge"))
 
+    def _record_lines(self, kind):
+        """Canonical JSON of every record, as `export_records` would serialize it.
+
+        Stored rows already are that canonical text. Only a Chunk whose text
+        lives in the chunks table is parsed and rebuilt, with all texts read in
+        one query instead of one lookup per chunk.
+        """
+        texts = (
+            dict(self.content.execute("SELECT node_iri, text FROM chunks"))
+            if kind == "node"
+            else {}
+        )
+        for key, value in self.content.execute(
+            "SELECT key, value FROM records WHERE kind=? ORDER BY key", (kind,)
+        ):
+            if texts and key.startswith('["Chunk",'):
+                record = json.loads(value)
+                props = record.get("props") or {}
+                text = (
+                    None
+                    if "text" in props
+                    else texts.get(self.node_iri("Chunk", record["id"]).value)
+                )
+                if text is not None:
+                    record["props"] = {**props, "text": text}
+                    value = canonical(record)
+            yield value
+
     def export_package(
         self,
         path: str | Path,
@@ -2781,10 +2809,11 @@ class KG:
         if not path.name.endswith(PACKAGE_SUFFIX):
             path = path.with_name(path.name + PACKAGE_SUFFIX)
         path.parent.mkdir(parents=True, exist_ok=True)
-        nodes, edges = self.export_records()
+        # Only Artifact records point at raw bytes.
+        artifacts = [json.loads(v) for (v,) in self._label_rows("Artifact", "value")]
         found = (
             resolve_blobs(
-                nodes,
+                artifacts,
                 raw_roots,
                 large_bytes=large_bytes,
                 include_large=include_large,
@@ -2800,26 +2829,38 @@ class KG:
         }
         self._flush_usage()  # this process's own use belongs in the package too
         usage_rows = self.usage_rows() if usage else []
-        members = [("nodes.jsonl", nodes), ("edges.jsonl", edges)]
-        if usage_rows:
-            members.append((USAGE_MEMBER, usage_rows))
-        payloads = {
-            name: "".join(canonical(r) + "\n" for r in records).encode("utf-8")
-            for name, records in members
+        lines = {
+            "nodes.jsonl": list(self._record_lines("node")),
+            "edges.jsonl": list(self._record_lines("edge")),
         }
+        if usage_rows:
+            lines[USAGE_MEMBER] = [canonical(row) for row in usage_rows]
+        payloads = {
+            name: "".join(line + "\n" for line in member).encode("utf-8")
+            for name, member in lines.items()
+        }
+
+        def counted(kind):  # the first key element is the label or relation
+            rows = self.content.execute(
+                "SELECT json_extract(key, '$[0]'), COUNT(*) FROM records "
+                "WHERE kind=? GROUP BY 1",
+                (kind,),
+            )
+            return dict(sorted((name, count) for name, count in rows))
+
         manifest = {
             "format": PACKAGE_FORMAT,
             "version": PACKAGE_VERSION if usage_rows else 3,
             "graph": self.name,
             "namespace": self.ns,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "counts": {"nodes": len(nodes), "edges": len(edges)},
-            "labels": dict(sorted(Counter(n["label"] for n in nodes).items())),
-            "rels": dict(sorted(Counter(e["rel"] for e in edges).items())),
-            "sources": sorted(
-                {n["id"] for n in nodes if n["label"] == "Source"}
-                | set().union(*(self._owners(n) for n in nodes))
-            ),
+            "counts": {
+                "nodes": len(lines["nodes.jsonl"]),
+                "edges": len(lines["edges.jsonl"]),
+            },
+            "labels": counted("node"),
+            "rels": counted("edge"),
+            "sources": self.sources(),
             "members": {
                 name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                 for name, data in payloads.items()
