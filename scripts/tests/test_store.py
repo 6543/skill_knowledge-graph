@@ -4,6 +4,7 @@ import gc
 import json
 
 import pytest
+
 from store import KG, GraphValidationError, validate_graph
 
 

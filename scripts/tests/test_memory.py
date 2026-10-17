@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from store import KG, GraphValidationError, note_records
 
 SCRIPT = str(Path(__file__).parents[1] / "kg.py")

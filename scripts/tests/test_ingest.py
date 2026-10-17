@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from ingest import Chunk, build_graph, chunk_text
 
 
@@ -144,9 +145,13 @@ def test_virtualenvs_and_vendored_trees_are_not_ingested(tmp_path):
     (source / "node_modules" / "left-pad").mkdir(parents=True)
     source.mkdir(exist_ok=True)
     (source / "README.md").write_text("# Real\nthe corpus\n")
-    (source / ".venv-kg" / "lib" / "site-packages" / "vendored.py").write_text("x = 1\n")
+    (source / ".venv-kg" / "lib" / "site-packages" / "vendored.py").write_text(
+        "x = 1\n"
+    )
     (source / "venv" / "bin" / "activate").write_text("export PATH=x\n")
-    (source / "node_modules" / "left-pad" / "index.js").write_text("module.exports = 1\n")
+    (source / "node_modules" / "left-pad" / "index.js").write_text(
+        "module.exports = 1\n"
+    )
 
     nodes, _edges = build_graph([source], source_name="fixture")
 
@@ -197,8 +202,14 @@ def test_same_source_from_differently_named_roots_merges_roots(tmp_path, monkeyp
         ("tpl http://localhost:${port}/api", ["http://localhost:${port}/api"]),
         ("*https://example.org/bold*", ["https://example.org/bold"]),
         ("junk http://. and http://... and http://\\x00bad", []),
-        ("host “https://woodpecker.example.com” done", ["https://woodpecker.example.com"]),
-        ("«https://example.org/a» ‹https://example.org/b›", ["https://example.org/a", "https://example.org/b"]),
+        (
+            "host “https://woodpecker.example.com” done",
+            ["https://woodpecker.example.com"],
+        ),
+        (
+            "«https://example.org/a» ‹https://example.org/b›",
+            ["https://example.org/a", "https://example.org/b"],
+        ),
         ("見る https://example.org/jp。次", ["https://example.org/jp"]),
         ("say ‘https://example.org/q’", ["https://example.org/q"]),
     ],

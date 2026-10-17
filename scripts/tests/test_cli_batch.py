@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 
-import kg as cli
 import pytest
+
+import kg as cli
 from ingest import build_graph
 from store import KG, write_records
 
@@ -46,7 +47,7 @@ def home(tmp_path, monkeypatch):
 
 def test_delete_from_file_previews_then_removes_in_one_transaction(home, capsys):
     refs = home / "doomed.txt"
-    lines = [f"Thing:t{i}" for i in range(0, 400)]
+    lines = [f"Thing:t{i}" for i in range(400)]
     lines += [
         '{"label": "Thing", "id": "t450", "props": {}}',
         "",

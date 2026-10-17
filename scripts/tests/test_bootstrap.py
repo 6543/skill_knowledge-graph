@@ -8,8 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import bootstrap
 import pytest
+
+import bootstrap
 from bootstrap import BootstrapError
 
 SKILL = Path(__file__).resolve().parents[2]

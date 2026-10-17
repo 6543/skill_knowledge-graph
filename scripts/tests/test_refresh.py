@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 import store
 from ingest import build_graph
 from store import KG, GraphValidationError, diff_records
@@ -159,7 +160,7 @@ def test_bookkeeping_relations_do_not_count_as_evidence(setup, tmp_path):
 
 
 def test_diff_reports_changes_memory_and_duplicate_current_versions(setup, tmp_path):
-    graph, raw, first = setup
+    graph, raw, _first = setup
     a = graph.export_records()
     fresh = ingest(
         raw,
@@ -186,7 +187,7 @@ def test_diff_reports_changes_memory_and_duplicate_current_versions(setup, tmp_p
 def test_memory_only_import_brings_notes_and_their_evidence_not_sources(
     setup, tmp_path
 ):
-    graph, raw, first = setup
+    graph, _raw, first = setup
     package = tmp_path / "fork.graph-skill-db"
     graph.load([{"label": "Decision", "id": "d1", "props": {"statement": "use x"}}], [])
     graph.export_package(package)
@@ -202,7 +203,7 @@ def test_memory_only_import_brings_notes_and_their_evidence_not_sources(
 
 
 def test_rechunked_unchanged_documents_drop_their_old_chunks(setup, tmp_path):
-    graph, raw, first = setup
+    graph, raw, _first = setup
     long_text = (
         "# Keep\n" + "\n".join(f"line {i} " + "x" * 40 for i in range(40)) + "\n"
     )
@@ -230,7 +231,7 @@ def test_rechunked_unchanged_documents_drop_their_old_chunks(setup, tmp_path):
 
 def test_refresh_takes_the_fresh_ingester_fields_of_its_own_records(setup):
     """The same chunk text (same ID) can get new locators from a newer ingester."""
-    graph, raw, first = setup
+    graph, _raw, first = setup
     keep = doc_id(first[0], "keep.md")
     chunk = chunk_of(first[0], keep)
     nodes = [

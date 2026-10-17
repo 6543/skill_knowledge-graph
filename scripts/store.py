@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import os
 import re
+import secrets
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -50,7 +53,22 @@ MENTION_LABELS = ("WebResource", "EnvironmentVariable")
 # Compaction: what a read keeps protected, and how fast an unused item cools.
 RECENT_READ_DAYS = 30
 USAGE_DECAY_DAYS = 90
-MAX_PACKAGE_BYTES = 512 * 1024 * 1024
+# Uncompressed bytes a package may hold, blobs included. Raising it is the
+# user's call: `PackageTooLargeError` names the doubled limit to ask for.
+MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
+# A package with more records than this is imported in batches of this many
+# records, staged in a temporary copy of the graph and swapped in at the end.
+IMPORT_BATCH_RECORDS = 50_000
+# A batch also ends after this many raw bytes, so a few huge records cannot
+# fill memory either; a package over it streams even with few records.
+IMPORT_BATCH_BYTES = 64 * 1024 * 1024
+# Conflicts a streamed import keeps for its report; the rest are only counted.
+CONFLICTS_KEPT = 1000
+STAGING_INFIX = ".import-"
+FAILED_INFIX = ".failed-"
+# Written to a staged graph's rdf_revision before its files are moved into
+# place: if the move is cut short, the next open rebuilds the RDF index.
+SWAP_PENDING = "swap-pending"
 BLOB_PREFIX = "blobs/"
 BLOB_NAME = re.compile(r"^[0-9a-f]{64}$")
 LARGE_BLOB_BYTES = 100 * 1024 * 1024
@@ -274,6 +292,24 @@ class GraphStateError(GraphValidationError):
     """The two stores of a graph disagree in a way that would lose data if opened."""
 
 
+class PackageTooLargeError(GraphValidationError):
+    """A package is over its byte limit.
+
+    The limit is only ever raised with the user's consent, one doubling at a
+    time, so the error carries the exact value to ask for.
+    """
+
+    def __init__(self, size: int, limit: int, hint: str = ""):
+        self.size = size
+        self.limit = limit
+        self.next_limit = limit * 2
+        super().__init__(
+            f"package exceeds max_bytes: {size} bytes uncompressed, limit {limit}. "
+            f"{hint}Ask the user before retrying with --max-bytes {self.next_limit} "
+            "(double the current limit)."
+        )
+
+
 # The RDF index records which SQLite revision it reflects, in a named graph that
 # default-graph queries never see. SQLite is authoritative and always commits
 # first, so an index stamped ahead of SQLite means SQLite lost committed writes.
@@ -463,16 +499,443 @@ def extract_blobs(package: str | Path, blob_dir: str | Path) -> dict:
     }
 
 
+PACKAGE_ERRORS = (
+    ValueError,
+    UnicodeError,
+    zipfile.BadZipFile,
+    RuntimeError,
+    NotImplementedError,
+)
+
+
+def _package_error(path, exc) -> GraphValidationError:
+    """A package problem as a validation error; validation errors pass through."""
+    if isinstance(exc, GraphValidationError):
+        return exc
+    return GraphValidationError(f"{path}: invalid graph package: {exc}")
+
+
+def _check_package_path(path: Path, max_bytes: int) -> None:
+    if max_bytes <= 0:
+        raise GraphValidationError("max_bytes must be positive")
+    if not zipfile.is_zipfile(path):
+        raise GraphValidationError(f"{path}: not a zip archive")
+
+
+def _package_header(archive: zipfile.ZipFile, path: Path, max_bytes: int):
+    """Validate everything but the record members; returns (manifest, has_usage).
+
+    Cheap: only the manifest is read. Member bytes are checked against it by
+    `_check_member` once they have been read.
+    """
+    entries = archive.infolist()
+    names = [entry.filename for entry in entries]
+    missing = PACKAGE_MEMBERS - set(names)
+    if missing:
+        raise GraphValidationError(f"{path}: archive is missing {sorted(missing)}")
+    blob_names = [name for name in names if name.startswith(BLOB_PREFIX)]
+    if len(names) != len(set(names)) or set(names) - PACKAGE_MEMBERS - {
+        USAGE_MEMBER
+    } - set(blob_names):
+        raise GraphValidationError("duplicate or unexpected archive members")
+    if any(not BLOB_NAME.match(name[len(BLOB_PREFIX) :]) for name in blob_names):
+        raise GraphValidationError("blob members must be named by their sha256 digest")
+    size = sum(entry.file_size for entry in entries)
+    if size > max_bytes:
+        raise PackageTooLargeError(size, max_bytes)
+    if archive.getinfo("manifest.json").file_size > 1024 * 1024:
+        raise GraphValidationError("manifest exceeds 1 MiB")
+    for entry in entries:
+        mode = (entry.external_attr >> 16) & 0o170000
+        if mode not in (0, 0o100000) or entry.flag_bits & 1:
+            raise GraphValidationError("encrypted or non-regular archive member")
+        if entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            raise GraphValidationError("unsupported ZIP compression")
+    manifest = strict_json(archive.read("manifest.json"))
+    if not isinstance(manifest, dict) or manifest.get("format") != PACKAGE_FORMAT:
+        raise GraphValidationError(f"{path}: not a {PACKAGE_FORMAT} archive")
+    version = manifest.get("version")
+    if type(version) is not int or not 1 <= version <= PACKAGE_VERSION:
+        raise GraphValidationError("unsupported package version")
+    declared = manifest.get("blobs") if version >= 3 else {}
+    if not isinstance(declared, dict) or any(
+        not isinstance(digest, str)
+        or not BLOB_NAME.match(digest)
+        or type(size) is not int
+        or size < 0
+        for digest, size in declared.items()
+    ):
+        raise GraphValidationError("invalid manifest blobs")
+    if set(declared) != {name[len(BLOB_PREFIX) :] for name in blob_names}:
+        raise GraphValidationError("manifest blob set mismatch")
+    for name in blob_names:
+        entry = archive.getinfo(name)
+        if entry.file_size != declared[name[len(BLOB_PREFIX) :]]:
+            raise GraphValidationError(f"{name}: byte count mismatch")
+    counts = manifest.get("counts")
+    if not isinstance(counts, dict) or any(
+        type(counts.get(k)) is not int or counts[k] < 0 for k in ("nodes", "edges")
+    ):
+        raise GraphValidationError("invalid manifest counts")
+    has_usage = USAGE_MEMBER in names
+    if has_usage != (version >= 4 and "usage" in manifest):
+        raise GraphValidationError(
+            f"{USAGE_MEMBER} and the manifest usage entry must come together "
+            "in a version 4 package"
+        )
+    if version >= 2:
+        members = {"nodes.jsonl", "edges.jsonl"} | (
+            {USAGE_MEMBER} if has_usage else set()
+        )
+        checks = manifest.get("members")
+        if not isinstance(checks, dict) or set(checks) != members:
+            raise GraphValidationError("missing member checksums")
+    return manifest, has_usage
+
+
+def _check_member(manifest: dict, name: str, size: int, digest: str) -> None:
+    """Compare a member's byte count and SHA-256 with the manifest (version 2+)."""
+    if manifest["version"] < 2:
+        return
+    check = manifest["members"][name]
+    if (
+        not isinstance(check, dict)
+        or type(check.get("bytes")) is not int
+        or check["bytes"] != size
+    ):
+        raise GraphValidationError(f"{name}: byte count mismatch")
+    if check.get("sha256") != digest:
+        raise GraphValidationError(f"{name}: checksum mismatch")
+
+
+class _PackageStream:
+    """A package read member by member and line by line, never whole.
+
+    Lines split on newline bytes only: canonical JSON keeps U+2028 and the other
+    separators that `str.splitlines` would cut a record at. Every full pass over
+    a member re-checks its bytes against the manifest, so a file changed between
+    passes is caught before anything is swapped in.
+    """
+
+    def __init__(self, path: str | Path, max_bytes: int):
+        self.path = Path(path)
+        _check_package_path(self.path, max_bytes)
+        try:
+            self.archive = zipfile.ZipFile(self.path)
+        except PACKAGE_ERRORS as exc:
+            raise _package_error(self.path, exc) from exc
+        try:
+            self.manifest, self.has_usage = _package_header(
+                self.archive, self.path, max_bytes
+            )
+        except BaseException as exc:
+            self.archive.close()
+            if isinstance(exc, PACKAGE_ERRORS):
+                raise _package_error(self.path, exc) from exc
+            raise
+        self.members = ("nodes.jsonl", "edges.jsonl") + (
+            (USAGE_MEMBER,) if self.has_usage else ()
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.archive.close()
+
+    def large(self, batch_records: int) -> bool:
+        """Too many records, or too many bytes, to hold in one batch."""
+        counts = self.manifest["counts"]
+        size = sum(
+            self.archive.getinfo(name).file_size
+            for name in ("nodes.jsonl", "edges.jsonl")
+        )
+        return (
+            counts["nodes"] + counts["edges"] > batch_records
+            or size > IMPORT_BATCH_BYTES
+        )
+
+    def lines(self, name: str):
+        """Yield (line number, raw bytes); checks byte count and digest at the end."""
+        digest = hashlib.sha256()
+        size = 0
+        with self.archive.open(name) as stream:
+            for number, line in enumerate(stream, 1):
+                digest.update(line)
+                size += len(line)
+                yield number, line
+        _check_member(self.manifest, name, size, digest.hexdigest())
+
+    def verify(self) -> None:
+        """Check every record member's checksum before parsing any of them."""
+        for name in self.members:
+            for _ in self.lines(name):
+                pass
+
+    def _parsed(self, name: str):
+        """Yield (record, raw line size) for every nonblank line."""
+        for number, line in self.lines(name):
+            text = line.decode("utf-8")
+            if not text.strip():
+                continue
+            try:
+                yield strict_json(text), len(line)
+            except ValueError as exc:
+                raise GraphValidationError(f"{name}:{number}: {exc}") from exc
+
+    def records(self, name: str):
+        return (record for record, _size in self._parsed(name))
+
+    def batches(self, name: str, records: int, max_bytes: int | None = None):
+        """Lists of records, each ending at `records` items or `max_bytes` raw bytes."""
+        max_bytes = IMPORT_BATCH_BYTES if max_bytes is None else max_bytes
+        batch, used = [], 0
+        for record, size in self._parsed(name):
+            batch.append(record)
+            used += size
+            if len(batch) >= records or used >= max_bytes:
+                yield batch
+                batch, used = [], 0
+        if batch:
+            yield batch
+
+
+# `canonical` without the per-call argument handling of json.dumps.
+_CANONICAL = json.JSONEncoder(
+    sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+).encode
+
+
+def _props_digest(props: dict) -> bytes:
+    """Equal digests exactly when `same_json` holds, short enough to keep on disk."""
+    return hashlib.blake2b(_CANONICAL(props).encode(), digest_size=16).digest()
+
+
+def _node_key(label: str, identifier: str) -> str:
+    """A scratch-index node key; labels never contain NUL, so it is unambiguous."""
+    return f"{label}\0{identifier}"
+
+
+class _PackageIndex:
+    """The keys of a streamed package, kept in a scratch database, not in memory.
+
+    Duplicate and endpoint checks need every key seen so far; for a package of
+    millions of records those keys alone outgrow a modest machine.
+    """
+
+    def __init__(self, path: Path):
+        self.db = sqlite3.connect(path)
+        self.db.executescript(
+            """
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=OFF;
+            CREATE TABLE nodes(
+                key TEXT PRIMARY KEY, digest BLOB NOT NULL, memory INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE edges(key TEXT PRIMARY KEY, digest BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE reached(key TEXT PRIMARY KEY) WITHOUT ROWID;
+            """
+        )
+
+    def close(self) -> None:
+        self.db.close()
+
+    def add(self, table: str, key: str, digest: bytes, *extra) -> bool:
+        """Record a key; False if it was already there with other props."""
+        values = (key, digest, *extra)
+        marks = ",".join("?" * len(values))
+        if self.db.execute(
+            f"INSERT OR IGNORE INTO {table} VALUES ({marks})", values
+        ).rowcount:
+            return True
+        stored = self.db.execute(
+            f"SELECT digest FROM {table} WHERE key=?", (key,)
+        ).fetchone()
+        return stored[0] == digest
+
+    def memory(self, key: str) -> bool | None:
+        """Whether a package node is a memory note; None if it is not in the package."""
+        row = self.db.execute("SELECT memory FROM nodes WHERE key=?", (key,)).fetchone()
+        return None if row is None else bool(row[0])
+
+    def reach(self, key: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO reached VALUES (?)", (key,))
+
+    def selected(self, key: str) -> bool:
+        """A node `memory_only` keeps: a memory note, or one a kept edge reaches."""
+        return bool(self.memory(key)) or bool(
+            self.db.execute("SELECT 1 FROM reached WHERE key=?", (key,)).fetchone()
+        )
+
+    def count(self, sql: str) -> int:
+        return self.db.execute(sql).fetchone()[0]
+
+
+def _validate_stream(package, index, memory_only=False, collect=False):
+    """Every package check, one record at a time against a key index on disk.
+
+    Returns record counts; with `memory_only`, also fills the index with the
+    nodes the selected edges reach. With `collect`, the parsed records come
+    back too, under "records" as (nodes, edges, usage rows).
+    """
+    manifest = package.manifest
+    labels, rels, sources = Counter(), Counter(), set()
+    nodes = edges = selected_edges = 0
+    kept = ([], [], []) if collect else None
+    for node in package.records("nodes.jsonl"):
+        if collect:
+            kept[0].append(node)
+        label, identifier, props = _validate_node(nodes, node)
+        if not index.add(
+            "nodes",
+            _node_key(label, identifier),
+            _props_digest(props),
+            label in MEMORY_LABELS,
+        ):
+            raise GraphValidationError(
+                f"conflicting duplicate node {label}:{identifier}"
+            )
+        labels[label] += 1
+        if label == "Source":
+            sources.add(identifier)
+        sources |= KG._owners({"props": props})
+        nodes += 1
+    for edge in package.records("edges.jsonl"):
+        if collect:
+            kept[1].append(edge)
+        identity, props = _validate_edge(edges, edge)
+        if not index.add("edges", _CANONICAL(identity), _props_digest(props)):
+            raise GraphValidationError(f"conflicting duplicate edge {identity}")
+        ends = (_node_key(*identity[1:3]), _node_key(*identity[3:5]))
+        flags = [index.memory(key) for key in ends]
+        for role, flag in zip(("source", "destination"), flags, strict=True):
+            if flag is None:
+                raise _missing_endpoint(edges, identity, role)
+        if memory_only and any(flags):
+            selected_edges += 1
+            for key, flag in zip(ends, flags, strict=True):
+                if not flag:
+                    index.reach(key)
+        rels[identity[0]] += 1
+        edges += 1
+    counts = manifest["counts"]
+    if nodes != counts["nodes"] or edges != counts["edges"]:
+        raise GraphValidationError("manifest record count mismatch")
+    if manifest["version"] >= 2 and manifest.get("sources") != sorted(sources):
+        raise GraphValidationError("manifest sources mismatch")
+    for field, actual in (("labels", labels), ("rels", rels)):
+        if field in manifest and manifest[field] != dict(actual):
+            raise GraphValidationError(f"manifest {field} mismatch")
+    usage_rows = 0
+    if package.has_usage:
+        for row in package.records(USAGE_MEMBER):
+            _check_usage_row(row)
+            usage_rows += 1
+            if collect:
+                kept[2].append(row)
+        if usage_rows != manifest["usage"]["rows"]:
+            raise GraphValidationError(f"{USAGE_MEMBER}: row count mismatch")
+    index.db.commit()
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "selected_edges": selected_edges,
+        "usage_rows": usage_rows,
+        "records": kept,
+    }
+
+
+@contextlib.contextmanager
+def _scanned(package, memory_only=False, collect=False, directory=None, prefix=None):
+    """Verify and validate a package; yields (key index, scan) while both are live."""
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=directory) as work:
+        index = _PackageIndex(Path(work) / "keys.sqlite3")
+        try:
+            try:
+                package.verify()
+                scan = _validate_stream(package, index, memory_only, collect)
+            except PACKAGE_ERRORS as exc:
+                raise _package_error(package.path, exc) from exc
+            yield index, scan
+        finally:
+            index.close()
+
+
+def _seal_chunks(nodes) -> None:
+    """Check and record each Chunk's text digest, in place."""
+    for node in nodes:
+        props = node.get("props") or {}
+        if node["label"] == "Chunk" and "text" in props:
+            digest = hashlib.sha256(props["text"].encode()).hexdigest()
+            if "sha256" in props and props["sha256"] != digest:
+                raise GraphValidationError(
+                    f"Chunk {node['id']}: text checksum mismatch"
+                )
+            props["sha256"] = digest
+            node["props"] = props
+
+
+class _Conflicts:
+    """The first `keep` conflicts and a count of all, so memory stays bounded."""
+
+    def __init__(self, keep: int):
+        self.keep = keep
+        self.kept: list = []
+        self.total = 0
+
+    def append(self, conflict) -> None:
+        self.total += 1
+        if len(self.kept) < self.keep:
+            self.kept.append(conflict)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _swap_rdf(staged: Path, target: Path, token: str) -> None:
+    """Move a staged RDF index into place, then delete the one it replaced.
+
+    Two renames, not one: a directory cannot replace a non-empty one. If the
+    second fails, the old index goes back; the caller already marked the new
+    SQLite records as ahead of it, so the next open rebuilds the index.
+    """
+    old = target.with_name(f"{target.name}.old-{token}")
+    if target.exists():
+        os.rename(target, old)
+    try:
+        os.rename(staged, target)
+    except BaseException:
+        if old.exists() and not target.exists():
+            os.rename(old, target)
+        raise
+    _fsync_dir(target.parent)
+    shutil.rmtree(old, ignore_errors=True)
+
+
 def _short(value, width: int = 80) -> str:
     text = canonical(value)
     return text if len(text) <= width else text[: width - 3] + "..."
 
 
-def conflict_message(conflicts, shown: int = 20) -> str:
-    """One readable error for every conflicting field in a rejected batch."""
+def conflict_message(conflicts, shown: int = 20, total: int | None = None) -> str:
+    """One readable error for every conflicting field in a rejected batch.
+
+    `total` counts conflicts beyond the ones listed, when only some were kept.
+    """
+    total = len(conflicts) if total is None else total
     lines = [
         (
-            f"{len(conflicts)} property conflict{'s' if len(conflicts) != 1 else ''}; "
+            f"{total} property conflict{'s' if total != 1 else ''}; "
             "nothing was written. Use versioned IDs or separate assertion nodes, or "
             "explicitly choose on_conflict='incoming' for an intended correction:"
         )
@@ -482,8 +945,8 @@ def conflict_message(conflicts, shown: int = 20) -> str:
             f"  {kind} {key} field {prop!r}: stored {_short(current)}, "
             f"incoming {_short(incoming)}"
         )
-    if len(conflicts) > shown:
-        lines.append(f"  ... and {len(conflicts) - shown} more")
+    if total > shown:
+        lines.append(f"  ... and {total - shown} more")
     return "\n".join(lines)
 
 
@@ -602,6 +1065,76 @@ def _check_props(owner: str, props) -> dict:
     return props
 
 
+def _validate_node(index: int, node) -> tuple[str, str, dict]:
+    """Check one node on its own; returns its label, id and props."""
+    if not isinstance(node, dict):
+        raise GraphValidationError(f"node {index}: expected an object")
+    label = _check_name("label", node.get("label"))
+    identifier = node.get("id")
+    if not isinstance(identifier, str) or not identifier:
+        raise GraphValidationError(f"node {index}: id must be a non-empty string")
+    props = _check_props(f"node {label}:{identifier}", node.get("props"))
+    if set(node) - {"label", "id", "props"}:
+        raise GraphValidationError(
+            f"node {index}: unknown fields; put metadata in props"
+        )
+    identifier.encode("utf-8")
+    if label == "Chunk":
+        for field in (
+            "text",
+            "path",
+            "heading",
+            "source",
+            "repository",
+            "document_id",
+        ):
+            if field in props and not isinstance(props[field], str):
+                raise GraphValidationError(
+                    f"Chunk {identifier}: {field} must be a string"
+                )
+        for field in ("start_line", "end_line"):
+            if props.get(field) is not None and (
+                type(props[field]) is not int or props[field] < 0
+            ):
+                raise GraphValidationError(
+                    f"Chunk {identifier}: {field} must be a nonnegative integer"
+                )
+        if (
+            props.get("start_line") is not None
+            and props.get("end_line") is not None
+            and props["end_line"] < props["start_line"]
+        ):
+            raise GraphValidationError(f"Chunk {identifier}: inverted line range")
+    return label, identifier, props
+
+
+def _validate_edge(index: int, edge) -> tuple[tuple, dict]:
+    """Check one edge on its own; returns its identity and props."""
+    if not isinstance(edge, dict):
+        raise GraphValidationError(f"edge {index}: expected an object")
+    _check_name("relation", edge.get("rel"))
+    _check_name("label", edge.get("src_label"))
+    _check_name("label", edge.get("dst_label"))
+    if set(edge) - {"rel", "src_label", "src", "dst_label", "dst", "props"}:
+        raise GraphValidationError(
+            f"edge {index}: unknown fields; put metadata in props"
+        )
+    for field in ("src", "dst"):
+        if not isinstance(edge.get(field), str) or not edge[field]:
+            raise GraphValidationError(
+                f"edge {index}: {field} must be a non-empty string"
+            )
+    identity = tuple(edge[k] for k in ("rel", "src_label", "src", "dst_label", "dst"))
+    return identity, _check_props(f"edge {index}", edge.get("props"))
+
+
+def _missing_endpoint(index: int, identity: tuple, role: str) -> GraphValidationError:
+    label, identifier = identity[1:3] if role == "source" else identity[3:5]
+    return GraphValidationError(
+        f"edge {index} {identity[0]}: missing endpoint {role} {label}:{identifier}"
+    )
+
+
 def validate_graph(nodes, edges, resolve=None) -> dict:
     """Validate names, duplicates, properties, and every edge endpoint.
 
@@ -611,44 +1144,7 @@ def validate_graph(nodes, edges, resolve=None) -> dict:
     known: dict[tuple[str, str], str] = {}
     node_count = 0
     for index, node in enumerate(nodes):
-        if not isinstance(node, dict):
-            raise GraphValidationError(f"node {index}: expected an object")
-        label = _check_name("label", node.get("label"))
-        identifier = node.get("id")
-        if not isinstance(identifier, str) or not identifier:
-            raise GraphValidationError(f"node {index}: id must be a non-empty string")
-        props = _check_props(f"node {label}:{identifier}", node.get("props"))
-        if set(node) - {"label", "id", "props"}:
-            raise GraphValidationError(
-                f"node {index}: unknown fields; put metadata in props"
-            )
-        identifier.encode("utf-8")
-        if label == "Chunk":
-            for field in (
-                "text",
-                "path",
-                "heading",
-                "source",
-                "repository",
-                "document_id",
-            ):
-                if field in props and not isinstance(props[field], str):
-                    raise GraphValidationError(
-                        f"Chunk {identifier}: {field} must be a string"
-                    )
-            for field in ("start_line", "end_line"):
-                if props.get(field) is not None and (
-                    type(props[field]) is not int or props[field] < 0
-                ):
-                    raise GraphValidationError(
-                        f"Chunk {identifier}: {field} must be a nonnegative integer"
-                    )
-            if (
-                props.get("start_line") is not None
-                and props.get("end_line") is not None
-                and props["end_line"] < props["start_line"]
-            ):
-                raise GraphValidationError(f"Chunk {identifier}: inverted line range")
+        label, identifier, props = _validate_node(index, node)
         key = (label, identifier)
         # Serialize only on a repeated key: almost every node is unique, and a
         # JSON dump per node was a large share of the validation time.
@@ -663,43 +1159,20 @@ def validate_graph(nodes, edges, resolve=None) -> dict:
     resolved = 0
     edge_seen = {}
     for index, edge in enumerate(edges):
-        if not isinstance(edge, dict):
-            raise GraphValidationError(f"edge {index}: expected an object")
-        rel = _check_name("relation", edge.get("rel"))
-        src_label = _check_name("label", edge.get("src_label"))
-        dst_label = _check_name("label", edge.get("dst_label"))
-        if set(edge) - {"rel", "src_label", "src", "dst_label", "dst", "props"}:
-            raise GraphValidationError(
-                f"edge {index}: unknown fields; put metadata in props"
-            )
-        for field in ("src", "dst"):
-            if not isinstance(edge.get(field), str) or not edge[field]:
-                raise GraphValidationError(
-                    f"edge {index}: {field} must be a non-empty string"
-                )
-        identity = tuple(
-            edge[k] for k in ("rel", "src_label", "src", "dst_label", "dst")
-        )
-        props = _check_props(f"edge {index}", edge.get("props"))
+        identity, props = _validate_edge(index, edge)
         if identity in edge_seen and not same_json(edge_seen[identity], props):
             raise GraphValidationError(f"conflicting duplicate edge {identity}")
         edge_seen[identity] = props
         for role, endpoint in (
-            ("source", (src_label, edge.get("src"))),
-            ("destination", (dst_label, edge.get("dst"))),
+            ("source", identity[1:3]),
+            ("destination", identity[3:5]),
         ):
             if endpoint in known:
                 continue
-            if (
-                resolve is not None
-                and isinstance(endpoint[1], str)
-                and resolve(*endpoint)
-            ):
+            if resolve is not None and resolve(*endpoint):
                 resolved += 1
                 continue
-            raise GraphValidationError(
-                f"edge {index} {rel}: missing endpoint {role} {endpoint[0]}:{endpoint[1]}"
-            )
+            raise _missing_endpoint(index, identity, role)
         edge_count += 1
     result = {"nodes": node_count, "unique_nodes": len(known), "edges": edge_count}
     if resolve is not None:
@@ -876,29 +1349,41 @@ def note_records(
     return [node], edges
 
 
-def _usage_rows(data: bytes, declared) -> list[dict]:
-    """Validate the usage member: one row per node, small non-negative counters."""
+def _check_usage_entry(declared) -> None:
     if not isinstance(declared, dict) or any(
         type(declared.get(k)) is not int or declared[k] < 0
         for k in ("rows", "since", "generation")
     ):
         raise GraphValidationError("invalid manifest usage entry")
-    rows = [
-        strict_json(line) for line in data.decode("utf-8").splitlines() if line.strip()
-    ]
-    for row in rows:
-        if (
-            not isinstance(row, dict)
-            or set(row) != USAGE_ROW_KEYS
-            or not all(isinstance(row[k], str) and row[k] for k in ("label", "id"))
-            or any(
-                type(row[k]) is not int or row[k] < 0 for k in ("hits", "reads", "day")
-            )
-        ):
-            raise GraphValidationError(f"{USAGE_MEMBER}: invalid row {row!r}"[:200])
-    if len(rows) != declared["rows"]:
-        raise GraphValidationError(f"{USAGE_MEMBER}: row count mismatch")
-    return rows
+
+
+def _check_usage_row(row) -> None:
+    if (
+        not isinstance(row, dict)
+        or set(row) != USAGE_ROW_KEYS
+        or not all(isinstance(row[k], str) and row[k] for k in ("label", "id"))
+        or any(type(row[k]) is not int or row[k] < 0 for k in ("hits", "reads", "day"))
+    ):
+        raise GraphValidationError(f"{USAGE_MEMBER}: invalid row {row!r}"[:200])
+
+
+def _usage_entry(manifest: dict) -> dict:
+    """The manifest's usage entry; a package without one counts as generation 0."""
+    return manifest.get("usage") or {"generation": 0, "since": usage_day()}
+
+
+def _write_member(archive: zipfile.ZipFile, name: str, lines) -> tuple:
+    """Stream lines into a new archive member; returns (lines, bytes, sha256)."""
+    digest = hashlib.sha256()
+    count = size = 0
+    with archive.open(name, "w", force_zip64=True) as member:
+        for line in lines:
+            data = (line + "\n").encode("utf-8")
+            member.write(data)
+            digest.update(data)
+            size += len(data)
+            count += 1
+    return count, size, digest.hexdigest()
 
 
 def diff_records(a_nodes, a_edges, b_nodes, b_edges, top: int = 20) -> dict:
@@ -2182,6 +2667,14 @@ class KG:
         # ingest still pays rebuild cost once instead of paying delta cost per record.
         if (len(removed) + len(changed)) * RDF_DELTA_RATIO > total:
             return self._ensure_rdf()
+        self._apply_quads(removed, changed)
+        self._stamp_state(self._meta("revision"))
+        self.store.flush()
+        with self.content:
+            self._set_meta("rdf_revision", self._meta("revision"))
+
+    def _apply_quads(self, removed, changed) -> None:
+        """Replace the quads of removed and changed records; stamps nothing."""
         for kind, record in removed:
             for quad in self._record_quads(kind, record):
                 self.store.remove(quad)
@@ -2190,10 +2683,6 @@ class KG:
                 for quad in self._record_quads(kind, previous):
                     self.store.remove(quad)
             self.store.extend(list(self._record_quads(kind, incoming)))
-        self._stamp_state(self._meta("revision"))
-        self.store.flush()
-        with self.content:
-            self._set_meta("rdf_revision", self._meta("revision"))
 
     # ----------------------------------------------------------------- storage
     @property
@@ -2410,16 +2899,7 @@ class KG:
         # keys or non-finite numbers, so the fast parser is enough here.
         nodes = json.loads(canonical(nodes))
         edges = json.loads(canonical(edges))
-        for node in nodes:
-            props = node.get("props") or {}
-            if node["label"] == "Chunk" and "text" in props:
-                digest = hashlib.sha256(props["text"].encode()).hexdigest()
-                if "sha256" in props and props["sha256"] != digest:
-                    raise GraphValidationError(
-                        f"Chunk {node['id']}: text checksum mismatch"
-                    )
-                props["sha256"] = digest
-                node["props"] = props
+        _seal_chunks(nodes)
         if source is not None:
             for record in nodes + edges:
                 owners = self._owners(record)
@@ -2460,19 +2940,9 @@ class KG:
         elif changed:
             self._apply_rdf_delta(base_revision, removed_records, changed_records)
         self._compact_after(changed)
-        return {
-            **validation,
-            "mode": _load_mode(replace, source),
-            "created": created,
-            "updated": updated,
-            "triples": self._triple_count(),
-            "chunks_written": written,
-            "chunks_total": self.content.execute(
-                "SELECT COUNT(*) FROM chunks"
-            ).fetchone()[0],
-            "graph_store": str(self.graph_path),
-            "content_store": str(self.content_path),
-        }
+        return self._summary(
+            validation, _load_mode(replace, source), created, updated, written
+        )
 
     def _load_transaction(
         self,
@@ -2516,50 +2986,13 @@ class KG:
             changed_before = changed
             conflicts = []
             for kind, records in (("node", nodes), ("edge", edges)):
-                for incoming in records:
-                    key = self._key(kind, incoming)
-                    row = self.content.execute(
-                        "SELECT value FROM records WHERE kind=? AND key=?", (kind, key)
-                    ).fetchone()
-                    previous = self._hydrate(json.loads(row[0])) if row else None
-                    props = dict(previous.get("props", {})) if previous else {}
-                    for prop, value in (incoming.get("props") or {}).items():
-                        merged = _merge_set_prop(
-                            kind, incoming, prop, props.get(prop), value
-                        )
-                        if merged is not None:
-                            props[prop] = merged
-                            continue
-                        if (
-                            prop in props
-                            and not same_json(props[prop], value)
-                            and on_conflict == "error"
-                        ):
-                            # Collect every conflict before aborting: fixing a
-                            # large merge one field per attempt is hopeless.
-                            conflicts.append((kind, key, prop, props[prop], value))
-                            continue
-                        props[prop] = value
-                    if (
-                        kind == "node"
-                        and incoming["label"] == "Chunk"
-                        and "text" in (incoming.get("props") or {})
-                        and "evicted" not in (incoming.get("props") or {})
-                    ):
-                        # Re-ingesting the text restores a chunk `compact` evicted.
-                        props.pop("evicted", None)
-                    if props or kind == "node" or "props" in incoming:
-                        incoming["props"] = props
-                    if previous and same_json(previous, incoming):
-                        continue
-                    created += previous is None
-                    updated += previous is not None
-                    self._put(kind, incoming, key)
-                    changed_records.append((kind, previous, incoming))
-                    changed += 1
-                    if kind == "node" and incoming["label"] == "Chunk":
-                        self._write_chunk(incoming)
-                        written += 1
+                made, renewed, chunks = self._merge_records(
+                    kind, records, on_conflict, conflicts, changed_records
+                )
+                created += made
+                updated += renewed
+                written += chunks
+                changed += made + renewed
             if dry_run:
                 raise _DryRun(
                     {
@@ -2596,6 +3029,59 @@ class KG:
             changed_records,
             validation,
         )
+
+    def _merge_records(self, kind, records, on_conflict, conflicts, changed_records):
+        """Merge records of one kind inside the caller's open transaction.
+
+        Conflicting fields are appended to `conflicts` and left as stored; the
+        caller decides whether to raise. `changed_records` collects
+        (kind, previous, incoming) for the RDF delta unless it is None.
+        Returns (created, updated, chunks written).
+        """
+        created = updated = written = 0
+        for incoming in records:
+            key = self._key(kind, incoming)
+            row = self.content.execute(
+                "SELECT value FROM records WHERE kind=? AND key=?", (kind, key)
+            ).fetchone()
+            previous = self._hydrate(json.loads(row[0])) if row else None
+            props = dict(previous.get("props", {})) if previous else {}
+            for prop, value in (incoming.get("props") or {}).items():
+                merged = _merge_set_prop(kind, incoming, prop, props.get(prop), value)
+                if merged is not None:
+                    props[prop] = merged
+                    continue
+                if (
+                    prop in props
+                    and not same_json(props[prop], value)
+                    and on_conflict == "error"
+                ):
+                    # Collect every conflict before aborting: fixing a
+                    # large merge one field per attempt is hopeless.
+                    conflicts.append((kind, key, prop, props[prop], value))
+                    continue
+                props[prop] = value
+            if (
+                kind == "node"
+                and incoming["label"] == "Chunk"
+                and "text" in (incoming.get("props") or {})
+                and "evicted" not in (incoming.get("props") or {})
+            ):
+                # Re-ingesting the text restores a chunk `compact` evicted.
+                props.pop("evicted", None)
+            if props or kind == "node" or "props" in incoming:
+                incoming["props"] = props
+            if previous and same_json(previous, incoming):
+                continue
+            created += previous is None
+            updated += previous is not None
+            self._put(kind, incoming, key)
+            if changed_records is not None:
+                changed_records.append((kind, previous, incoming))
+            if kind == "node" and incoming["label"] == "Chunk":
+                self._write_chunk(incoming)
+                written += 1
+        return created, updated, written
 
     def _bulk_index_begin(self, incoming: int, replace: bool) -> bool:
         """Drop the full-text triggers for a large write; see `_bulk_index_end`.
@@ -2765,28 +3251,16 @@ class KG:
         """Canonical JSON of every record, as `export_records` would serialize it.
 
         Stored rows already are that canonical text. Only a Chunk whose text
-        lives in the chunks table is parsed and rebuilt, with all texts read in
-        one query instead of one lookup per chunk.
+        lives in the chunks table is parsed and gets its text back, by one
+        indexed lookup, so export holds one record at a time, not every text.
         """
-        texts = (
-            dict(self.content.execute("SELECT node_iri, text FROM chunks"))
-            if kind == "node"
-            else {}
-        )
         for key, value in self.content.execute(
             "SELECT key, value FROM records WHERE kind=? ORDER BY key", (kind,)
         ):
-            if texts and key.startswith('["Chunk",'):
+            if kind == "node" and key.startswith('["Chunk",'):
                 record = json.loads(value)
-                props = record.get("props") or {}
-                text = (
-                    None
-                    if "text" in props
-                    else texts.get(self.node_iri("Chunk", record["id"]).value)
-                )
-                if text is not None:
-                    record["props"] = {**props, "text": text}
-                    value = canonical(record)
+                if "text" not in (record.get("props") or {}):
+                    value = canonical(self._hydrate(record))
             yield value
 
     def export_package(
@@ -2803,7 +3277,9 @@ class KG:
 
         Referenced raw files are carried alongside the records as a
         content-addressed object store under blobs/, so an import can restore
-        the evidence that Artifact records only point at.
+        the evidence that Artifact records only point at. Records stream into
+        the archive; the manifest, which needs their counts and digests, comes
+        last.
         """
         path = Path(path)
         if not path.name.endswith(PACKAGE_SUFFIX):
@@ -2829,16 +3305,12 @@ class KG:
         }
         self._flush_usage()  # this process's own use belongs in the package too
         usage_rows = self.usage_rows() if usage else []
-        lines = {
-            "nodes.jsonl": list(self._record_lines("node")),
-            "edges.jsonl": list(self._record_lines("edge")),
+        members = {
+            "nodes.jsonl": self._record_lines("node"),
+            "edges.jsonl": self._record_lines("edge"),
         }
         if usage_rows:
-            lines[USAGE_MEMBER] = [canonical(row) for row in usage_rows]
-        payloads = {
-            name: "".join(line + "\n" for line in member).encode("utf-8")
-            for name, member in lines.items()
-        }
+            members[USAGE_MEMBER] = map(canonical, usage_rows)
 
         def counted(kind):  # the first key element is the label or relation
             rows = self.content.execute(
@@ -2848,41 +3320,56 @@ class KG:
             )
             return dict(sorted((name, count) for name, count in rows))
 
-        manifest = {
-            "format": PACKAGE_FORMAT,
-            "version": PACKAGE_VERSION if usage_rows else 3,
-            "graph": self.name,
-            "namespace": self.ns,
-            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "counts": {
-                "nodes": len(lines["nodes.jsonl"]),
-                "edges": len(lines["edges.jsonl"]),
-            },
-            "labels": counted("node"),
-            "rels": counted("edge"),
-            "sources": self.sources(),
-            "members": {
-                name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                for name, data in payloads.items()
-            },
-            "blobs": dict(stored),
-        }
-        if usage_rows:
-            manifest["usage"] = {**self._usage_meta(), "rows": len(usage_rows)}
-        payloads["manifest.json"] = canonical(manifest).encode("utf-8")
-        if sum(map(len, payloads.values())) + sum(stored.values()) > max_bytes:
-            raise GraphValidationError(
-                "package exceeds max_bytes; shard the corpus, drop blobs with "
-                "--no-blobs, or explicitly raise the limit"
-            )
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
         try:
             with os.fdopen(fd, "w+b") as stream:
                 with zipfile.ZipFile(
                     stream, "w", zipfile.ZIP_DEFLATED, compresslevel=6
                 ) as archive:
-                    for name, data in payloads.items():
-                        archive.writestr(name, data)
+                    written = {
+                        name: _write_member(archive, name, lines)
+                        for name, lines in members.items()
+                    }
+                    manifest = {
+                        "format": PACKAGE_FORMAT,
+                        "version": PACKAGE_VERSION if usage_rows else 3,
+                        "graph": self.name,
+                        "namespace": self.ns,
+                        "exported_at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                        "counts": {
+                            "nodes": written["nodes.jsonl"][0],
+                            "edges": written["edges.jsonl"][0],
+                        },
+                        "labels": counted("node"),
+                        "rels": counted("edge"),
+                        "sources": self.sources(),
+                        "members": {
+                            name: {"bytes": size, "sha256": digest}
+                            for name, (_lines, size, digest) in written.items()
+                        },
+                        "blobs": dict(stored),
+                    }
+                    if usage_rows:
+                        manifest["usage"] = {
+                            **self._usage_meta(),
+                            "rows": len(usage_rows),
+                        }
+                    data = canonical(manifest).encode("utf-8")
+                    size = (
+                        len(data)
+                        + sum(size for _n, size, _d in written.values())
+                        + sum(stored.values())
+                    )
+                    if size > max_bytes:
+                        raise PackageTooLargeError(
+                            size,
+                            max_bytes,
+                            hint="Shard the corpus or drop blobs with --no-blobs; "
+                            "otherwise ",
+                        )
+                    archive.writestr("manifest.json", data)
                     for digest, source in sorted(found["blobs"].items()):
                         with (
                             source.open("rb") as raw,
@@ -2916,150 +3403,59 @@ class KG:
     def read_package(
         path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES, with_usage: bool = False
     ):
-        """Validate a package; returns (manifest, nodes, edges[, usage rows])."""
-        path = Path(path)
-        if max_bytes <= 0:
-            raise GraphValidationError("max_bytes must be positive")
-        if not zipfile.is_zipfile(path):
-            raise GraphValidationError(f"{path}: not a zip archive")
-        try:
-            with zipfile.ZipFile(path) as archive:
-                entries = archive.infolist()
-                names = [entry.filename for entry in entries]
-                missing = PACKAGE_MEMBERS - set(names)
-                if missing:
-                    raise GraphValidationError(
-                        f"{path}: archive is missing {sorted(missing)}"
-                    )
-                blob_names = [name for name in names if name.startswith(BLOB_PREFIX)]
-                if len(names) != len(set(names)) or set(names) - PACKAGE_MEMBERS - {
-                    USAGE_MEMBER
-                } - set(blob_names):
-                    raise GraphValidationError(
-                        "duplicate or unexpected archive members"
-                    )
-                if any(
-                    not BLOB_NAME.match(name[len(BLOB_PREFIX) :]) for name in blob_names
-                ):
-                    raise GraphValidationError(
-                        "blob members must be named by their sha256 digest"
-                    )
-                if sum(entry.file_size for entry in entries) > max_bytes:
-                    raise GraphValidationError("package exceeds max_bytes")
-                if archive.getinfo("manifest.json").file_size > 1024 * 1024:
-                    raise GraphValidationError("manifest exceeds 1 MiB")
-                for entry in entries:
-                    mode = (entry.external_attr >> 16) & 0o170000
-                    if mode not in (0, 0o100000) or entry.flag_bits & 1:
-                        raise GraphValidationError(
-                            "encrypted or non-regular archive member"
-                        )
-                    if entry.compress_type not in (
-                        zipfile.ZIP_STORED,
-                        zipfile.ZIP_DEFLATED,
-                    ):
-                        raise GraphValidationError("unsupported ZIP compression")
-                manifest = strict_json(archive.read("manifest.json"))
-                if (
-                    not isinstance(manifest, dict)
-                    or manifest.get("format") != PACKAGE_FORMAT
-                ):
-                    raise GraphValidationError(
-                        f"{path}: not a {PACKAGE_FORMAT} archive"
-                    )
-                version = manifest.get("version")
-                if type(version) is not int or not 1 <= version <= PACKAGE_VERSION:
-                    raise GraphValidationError("unsupported package version")
-                declared = manifest.get("blobs") if version >= 3 else {}
-                if not isinstance(declared, dict) or any(
-                    not isinstance(digest, str)
-                    or not BLOB_NAME.match(digest)
-                    or type(size) is not int
-                    or size < 0
-                    for digest, size in declared.items()
-                ):
-                    raise GraphValidationError("invalid manifest blobs")
-                if set(declared) != {name[len(BLOB_PREFIX) :] for name in blob_names}:
-                    raise GraphValidationError("manifest blob set mismatch")
-                for name in blob_names:
-                    entry = archive.getinfo(name)
-                    if entry.file_size != declared[name[len(BLOB_PREFIX) :]]:
-                        raise GraphValidationError(f"{name}: byte count mismatch")
-                counts = manifest.get("counts")
-                if not isinstance(counts, dict) or any(
-                    type(counts.get(k)) is not int or counts[k] < 0
-                    for k in ("nodes", "edges")
-                ):
-                    raise GraphValidationError("invalid manifest counts")
-                has_usage = USAGE_MEMBER in names
-                if has_usage != (version >= 4 and "usage" in manifest):
-                    raise GraphValidationError(
-                        f"{USAGE_MEMBER} and the manifest usage entry must come together "
-                        "in a version 4 package"
-                    )
-                payloads = {
-                    name: archive.read(name)
-                    for name in ("nodes.jsonl", "edges.jsonl")
-                    + ((USAGE_MEMBER,) if has_usage else ())
-                }
-                if version >= 2:
-                    checks = manifest.get("members")
-                    if not isinstance(checks, dict) or set(checks) != set(payloads):
-                        raise GraphValidationError("missing member checksums")
-                    for name, data in payloads.items():
-                        check = checks[name]
-                        if (
-                            not isinstance(check, dict)
-                            or type(check.get("bytes")) is not int
-                            or check["bytes"] != len(data)
-                        ):
-                            raise GraphValidationError(f"{name}: byte count mismatch")
-                        if check.get("sha256") != hashlib.sha256(data).hexdigest():
-                            raise GraphValidationError(f"{name}: checksum mismatch")
-                usage_rows = (
-                    _usage_rows(payloads[USAGE_MEMBER], manifest["usage"])
-                    if has_usage
-                    else []
-                )
-                records = []
-                for name in ("nodes.jsonl", "edges.jsonl"):
-                    records.append(
-                        [
-                            strict_json(line)
-                            for line in payloads[name].decode("utf-8").splitlines()
-                            if line.strip()
-                        ]
-                    )
-                nodes, edges = records
-                if len(nodes) != counts["nodes"] or len(edges) != counts["edges"]:
-                    raise GraphValidationError("manifest record count mismatch")
-                validate_graph(nodes, edges)
-                if version >= 2:
-                    actual_sources = sorted(
-                        {n["id"] for n in nodes if n["label"] == "Source"}
-                        | set().union(*(KG._owners(n) for n in nodes))
-                    )
-                    if manifest.get("sources") != actual_sources:
-                        raise GraphValidationError("manifest sources mismatch")
-                for field, actual in (
-                    ("labels", Counter(n["label"] for n in nodes)),
-                    ("rels", Counter(e["rel"] for e in edges)),
-                ):
-                    if field in manifest and manifest[field] != dict(actual):
-                        raise GraphValidationError(f"manifest {field} mismatch")
-                if with_usage:
-                    return manifest, nodes, edges, usage_rows
-                return manifest, nodes, edges
-        except (
-            ValueError,
-            UnicodeError,
-            zipfile.BadZipFile,
-            RuntimeError,
-            NotImplementedError,
-        ) as exc:
-            if isinstance(exc, GraphValidationError):
-                raise
-            raise GraphValidationError(f"{path}: invalid graph package: {exc}") from exc
+        """Validate a package and load it into memory.
+
+        Returns (manifest, nodes, edges[, usage rows]); `check_package` validates
+        without holding the records.
+        """
+        with (
+            _PackageStream(path, max_bytes) as package,
+            _scanned(package, collect=True) as (_index, scan),
+        ):
+            nodes, edges, usage_rows = scan["records"]
+            if with_usage:
+                return package.manifest, nodes, edges, usage_rows
+            return package.manifest, nodes, edges
+
+    @staticmethod
+    def check_package(path: str | Path, max_bytes: int = MAX_PACKAGE_BYTES):
+        """Validate a package in bounded memory; returns (manifest, record counts)."""
+        with _PackageStream(path, max_bytes) as package, _scanned(package) as (_, scan):
+            counts = {key: scan[key] for key in ("nodes", "edges", "usage_rows")}
+            return package.manifest, counts
+
+    def _summary(self, validation, mode, created, updated, written) -> dict:
+        """The report of a committed load or import."""
+        return {
+            **validation,
+            "mode": mode,
+            "created": created,
+            "updated": updated,
+            "triples": self._triple_count(),
+            "chunks_written": written,
+            "chunks_total": self.content.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0],
+            "graph_store": str(self.graph_path),
+            "content_store": str(self.content_path),
+        }
+
+    def _import_report(self, result, path, manifest, kept, blob_dir, usage, **extra):
+        blobs = extract_blobs(path, blob_dir) if blob_dir else skipped_blobs(manifest)
+        blobs["kept"] = kept["extracted"]
+        # The graph's own blob store is created by the first blob it keeps.
+        blobs["store"] = kept["dir"] if Path(kept["dir"]).is_dir() else None
+        return {
+            **result,
+            "package": str(path),
+            "manifest": manifest,
+            "integrity": "sha256"
+            if manifest["version"] >= 2
+            else "legacy-no-checksums",
+            "blobs": blobs,
+            "usage": usage,
+            **{key: value for key, value in extra.items() if value},
+        }
 
     def import_package(
         self,
@@ -3071,10 +3467,31 @@ class KG:
         dry_run: bool = False,
         usage: bool = True,
         memory_only: bool = False,
+        batch_records: int | None = None,
     ) -> dict:
         """Merge a package. With `memory_only`, take only the memory notes and the
         nodes their edges reach: the way to merge a fork's lessons without bringing
-        back source versions this graph has already refreshed or pruned."""
+        back source versions this graph has already refreshed or pruned.
+
+        A package with more than `batch_records` records (IMPORT_BATCH_RECORDS by
+        default) or more than IMPORT_BATCH_BYTES of records is streamed; see
+        `_import_streamed`. Smaller packages load in memory, in one transaction.
+        """
+        batch = IMPORT_BATCH_RECORDS if batch_records is None else batch_records
+        if type(batch) is not int or batch <= 0:
+            raise GraphValidationError("batch_records must be a positive integer")
+        with _PackageStream(path, max_bytes) as package:
+            if package.large(batch):
+                return self._import_streamed(
+                    package,
+                    replace=replace,
+                    on_conflict=on_conflict,
+                    blob_dir=blob_dir,
+                    dry_run=dry_run,
+                    usage=usage,
+                    memory_only=memory_only,
+                    batch=batch,
+                )
         manifest, nodes, edges, usage_rows = self.read_package(
             path, max_bytes=max_bytes, with_usage=True
         )
@@ -3117,24 +3534,432 @@ class KG:
         merged = 0
         if usage and (usage_rows or replace):
             merged = self._merge_usage(
-                usage_rows,
-                manifest.get("usage") or {"generation": 0, "since": usage_day()},
-                replace=replace,
+                usage_rows, _usage_entry(manifest), replace=replace
             )
-        blobs = extract_blobs(path, blob_dir) if blob_dir else skipped_blobs(manifest)
-        blobs["kept"] = kept["extracted"]
-        blobs["store"] = kept["dir"]
-        return {
-            **result,
-            "package": str(path),
-            "manifest": manifest,
-            "integrity": "sha256"
-            if manifest["version"] >= 2
-            else "legacy-no-checksums",
-            "blobs": blobs,
-            "usage": {"rows": len(usage_rows), "merged": merged},
-            **({"memory_only": selection} if selection else {}),
+        return self._import_report(
+            result,
+            path,
+            manifest,
+            kept,
+            blob_dir,
+            {"rows": len(usage_rows), "merged": merged},
+            memory_only=selection,
+        )
+
+    # --------------------------------------------------------- streamed import
+    def _import_streamed(
+        self,
+        package: _PackageStream,
+        replace: bool,
+        on_conflict: str,
+        blob_dir,
+        dry_run: bool,
+        usage: bool,
+        memory_only: bool,
+        batch: int,
+    ) -> dict:
+        """Import a large package in bounded memory, all or nothing.
+
+        The scan checks member checksums, then validates every record against a
+        key index on disk. A probe then merges into this graph inside one
+        transaction that is always rolled back: a dry run reports from it,
+        conflicts are rejected by it, and an import that would change nothing
+        ends with it, without copying the graph. Only a real change is merged
+        into a staged copy, checked, and swapped in.
+        """
+        if on_conflict not in {"error", "incoming"}:
+            raise GraphValidationError("on_conflict must be error or incoming")
+        self._clear_stale_staging()
+        merge = {
+            "replace": replace,
+            "on_conflict": on_conflict,
+            "memory_only": memory_only,
+            "batch": batch,
         }
+        with _scanned(
+            package,
+            memory_only,
+            directory=self.home,
+            prefix=f".{self._staging_prefix()}.scan-",
+        ) as (index, scan):
+            selection = None
+            if memory_only:
+                selection = {
+                    "memory_nodes": index.count(
+                        "SELECT COUNT(*) FROM nodes WHERE memory=1"
+                    ),
+                    "evidence_nodes": index.count("SELECT COUNT(*) FROM reached"),
+                    "edges": scan["selected_edges"],
+                }
+            report = None
+            # A replacement always changes the graph and cannot conflict, so
+            # only its dry run needs the probe.
+            if dry_run or not replace:
+                report = self._merge_package(
+                    package, index, scan, probe=True, stop_early=not dry_run, **merge
+                )
+            if dry_run:
+                return {
+                    **report["validation"],
+                    "dry_run": True,
+                    "mode": _load_mode(replace, None),
+                    "created": report["created"],
+                    "updated": report["updated"],
+                    "removed": 0,
+                    "conflicts": report["conflicts"],
+                    "conflicts_total": report["conflicts_total"],
+                    "package": str(package.path),
+                    "manifest": package.manifest,
+                    "streamed": {"batch_records": batch, "batches": report["batches"]},
+                    **({"memory_only": selection} if selection else {}),
+                }
+            if report and report["conflicts_total"]:
+                conflicts = report["_conflicts"]
+                raise GraphValidationError(
+                    conflict_message(conflicts.kept, total=conflicts.total)
+                )
+            kept = extract_blobs(package.path, self.blob_path)
+            if report is None or report["changed"]:
+                report = self._stage_and_swap(package, index, scan, **merge)
+        merged = 0
+        if usage and (scan["usage_rows"] or replace):
+            merged = self._import_usage(package, replace, batch)
+        result = self._summary(
+            report["validation"],
+            _load_mode(replace, None),
+            report["created"],
+            report["updated"],
+            report["written"],
+        )
+        return self._import_report(
+            result,
+            package.path,
+            package.manifest,
+            kept,
+            blob_dir,
+            {"rows": scan["usage_rows"], "merged": merged},
+            streamed={"batch_records": batch, "batches": report["batches"]},
+            memory_only=selection,
+        )
+
+    def _staging_prefix(self) -> str:
+        """Name stem of this graph's staged copies; long names are hashed to fit."""
+        if len(self.name) <= 108:
+            return self.name
+        return hashlib.blake2b(self.name.encode(), digest_size=8).hexdigest()
+
+    def _remove_graph_files(self, name: str) -> None:
+        shutil.rmtree(self.home / "rdf" / f"{name}.oxi", ignore_errors=True)
+        for path in (self.home / "content").glob(f"{name}.sqlite3*"):
+            path.unlink(missing_ok=True)
+        shutil.rmtree(self.home / "blobs" / name, ignore_errors=True)
+
+    def _clear_stale_staging(self) -> None:
+        """Delete what a killed import of this graph left behind.
+
+        Safe while this graph is open: its RDF lock keeps every other process
+        from importing into it, so no live stage can match these names.
+        """
+        stem = re.escape(self._staging_prefix())
+        stage = rf"{stem}{re.escape(STAGING_INFIX)}[0-9a-f]{{12}}"
+        patterns = (
+            (self.home / "rdf", rf"{stage}\.oxi"),
+            (
+                self.home / "rdf",
+                rf"{re.escape(self.graph_path.name)}\.old-[0-9a-f]{{12}}",
+            ),
+            (self.home / "content", rf"{stage}\.sqlite3(-journal|-wal|-shm)?"),
+            (self.home / "blobs", stage),
+            (self.home, rf"\.{stem}\.scan-\w+"),
+        )
+        for directory, pattern in patterns:
+            if not directory.is_dir():
+                continue
+            for entry in directory.iterdir():
+                if not re.fullmatch(pattern, entry.name):
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+
+    def _stage_copy(self) -> KG:
+        """Open a private copy of this graph to stage an import in.
+
+        SQLite is copied with its backup API; the RDF index is checkpointed,
+        which hard-links its files instead of copying them.
+        """
+        name = f"{self._staging_prefix()}{STAGING_INFIX}{secrets.token_hex(6)}"
+        self._flush_usage()  # counted use belongs in the copy, or the swap loses it
+        if self.content.in_transaction:
+            self.content.commit()
+        try:
+            copy = sqlite3.connect(self.home / "content" / f"{name}.sqlite3")
+            try:
+                with copy:
+                    self.content.backup(copy)
+            finally:
+                copy.close()
+            self.store.flush()
+            self.store.backup(str(self.home / "rdf" / f"{name}.oxi"))
+            return KG(name)
+        except BaseException:
+            self._remove_graph_files(name)
+            raise
+
+    def _stage_finish(self, staged: dict) -> None:
+        """Reject a conflicting stage, else index it and bring RDF up to date."""
+        conflicts = staged["_conflicts"]
+        if conflicts.total:
+            raise GraphValidationError(
+                conflict_message(conflicts.kept, total=conflicts.total)
+            )
+        changed = staged["changed"]
+        with self.content:
+            if staged["bulk"]:
+                self._bulk_index_end(rebuild=changed > staged["cleared"])
+            if changed:
+                self._set_meta("revision", staged["base"] + 1)
+        if not changed:
+            return
+        if staged["live"]:
+            # SQLite committed first, so the stamp is never ahead of it.
+            self._stamp_state(staged["base"] + 1)
+            self.store.flush()
+            with self.content:
+                self._set_meta("rdf_revision", staged["base"] + 1)
+        else:
+            self._ensure_rdf()
+
+    def _swap_in(self, staging: KG) -> None:
+        """Replace this graph's files with a finished stage, then reopen.
+
+        SQLite moves first: it is authoritative, and its revision is ahead of
+        the old RDF stamp. It also carries SWAP_PENDING as its RDF revision, so
+        if the RDF move is cut short the next open rebuilds the index instead
+        of trusting the old one. Only after both moves, and only if the staged
+        index was current, is the marker cleared.
+        """
+        revision = staging._meta("revision")
+        current = (
+            staging._state_stamp() == int(revision)
+            and staging._meta("rdf_revision") == revision
+        )
+        with staging.content:
+            staging._set_meta("rdf_revision", SWAP_PENDING)
+        staged_content, staged_rdf = staging.content_path, staging.graph_path
+        token = staging.name.rsplit("-", 1)[-1]
+        staging.close()
+        self.close()
+        try:
+            os.replace(staged_content, self.content_path)
+            _fsync_dir(self.content_path.parent)
+            _swap_rdf(staged_rdf, self.graph_path, token)
+            if not current:
+                return  # the reopen below rebuilds the index
+            content = sqlite3.connect(self.content_path)
+            try:
+                with content:
+                    content.execute(
+                        "UPDATE metadata SET value=? WHERE key='rdf_revision'",
+                        (revision,),
+                    )
+            finally:
+                content.close()
+        finally:
+            self.__init__(self.name)
+
+    def _package_batches(self, package, index, memory_only: bool, batch: int):
+        """(kind, records) in package order and bounded batches, re-checked as
+        they are read, with `memory_only` applied."""
+        for kind, member in (("node", "nodes.jsonl"), ("edge", "edges.jsonl")):
+            number = 0
+            for records in package.batches(member, batch):
+                wanted = []
+                for record in records:
+                    if kind == "node":
+                        label, identifier, _ = _validate_node(number, record)
+                        keep = not memory_only or index.selected(
+                            _node_key(label, identifier)
+                        )
+                    else:
+                        identity, _ = _validate_edge(number, record)
+                        keep = not memory_only or any(
+                            index.memory(_node_key(*end))
+                            for end in (identity[1:3], identity[3:5])
+                        )
+                    number += 1
+                    if keep:
+                        wanted.append(record)
+                if wanted:
+                    yield kind, wanted
+
+    def _merge_package(
+        self,
+        package,
+        index,
+        scan,
+        replace,
+        on_conflict,
+        memory_only,
+        batch,
+        probe=False,
+        stop_early=False,
+    ):
+        """Merge the package into this graph, one bounded batch at a time.
+
+        As a probe, everything runs in one transaction that is rolled back at
+        the end. With `stop_early` the probe ends at the first batch that would
+        change something, unless it found conflicts: those are all collected.
+        Otherwise (a staged copy) each batch commits on its own: the stage is
+        disposable, and small transactions keep the rollback journal small.
+        The full-text triggers stay off for a large load, and the RDF index
+        follows batch by batch only while the change stays small next to the
+        graph.
+        """
+        base = int(self._meta("revision"))
+        conflicts = _Conflicts(CONFLICTS_KEPT)
+        created = updated = written = changed = batches = 0
+        loaded = {"node": 0, "edge": 0}
+        live = not probe and not replace and self._meta("rdf_revision") == str(base)
+        incoming = (
+            index.count("SELECT COUNT(*) FROM nodes WHERE memory=1")
+            + index.count("SELECT COUNT(*) FROM reached")
+            if memory_only
+            else scan["nodes"]
+        )
+        step = contextlib.nullcontext() if probe else self.content
+        if probe and not self.content.in_transaction:
+            self.content.execute("BEGIN")
+        try:
+            with step:
+                if replace:
+                    changed = self.content.execute(
+                        "SELECT COUNT(*) FROM records"
+                    ).fetchone()[0]
+                    self.content.execute("DELETE FROM records")
+                    self.content.execute("DELETE FROM chunks")
+                    self.content.execute("DELETE FROM node_index")
+                bulk = self._bulk_index_begin(incoming, replace)
+            cleared = changed
+            for kind, records in self._package_batches(
+                package, index, memory_only, batch
+            ):
+                if kind == "node":
+                    _seal_chunks(records)
+                delta = [] if live else None
+                with step:
+                    made, renewed, chunks = self._merge_records(
+                        kind, records, on_conflict, conflicts, delta
+                    )
+                created += made
+                updated += renewed
+                written += chunks
+                changed += made + renewed
+                loaded[kind] += len(records)
+                batches += 1
+                if live:
+                    total = self.content.execute(
+                        "SELECT COUNT(*) FROM records"
+                    ).fetchone()[0]
+                    if (changed - cleared) * RDF_DELTA_RATIO > total:
+                        live = False  # cheaper to rebuild once at the end
+                    else:
+                        self._apply_quads((), delta)
+                if stop_early and changed > cleared and not conflicts.total:
+                    break
+        finally:
+            if probe:
+                self.content.rollback()
+        validation = {
+            "nodes": loaded["node"],
+            "unique_nodes": incoming
+            if memory_only
+            else index.count("SELECT COUNT(*) FROM nodes"),
+            "edges": loaded["edge"],
+        }
+        if not replace:
+            # Packages are self-contained, so no endpoint comes from the store.
+            validation["endpoints_resolved_in_store"] = 0
+        return {
+            "base": base,
+            "bulk": bulk,
+            "live": live,
+            "cleared": cleared,
+            "changed": changed,
+            "created": created,
+            "updated": updated,
+            "written": written,
+            "batches": batches,
+            "validation": validation,
+            "conflicts": [
+                {
+                    "kind": kind,
+                    "key": key,
+                    "field": prop,
+                    "stored": current,
+                    "incoming": value,
+                }
+                for kind, key, prop, current, value in conflicts.kept
+            ],
+            "conflicts_total": conflicts.total,
+            "_conflicts": conflicts,
+        }
+
+    def _quick_check(self) -> str:
+        return self.content.execute("PRAGMA quick_check").fetchone()[0]
+
+    def _stage_and_swap(self, package, index, scan, **merge) -> dict:
+        """Merge into a staged copy, check it, swap it in; returns the merge report.
+
+        A stage that fails SQLite's quick_check is never swapped in. Its files
+        are kept under a `.failed-` name, which stale-stage cleanup leaves
+        alone, because a store that broke during VACUUM is evidence.
+        """
+        staging = self._stage_copy()
+        failed = None
+        try:
+            report = staging._merge_package(package, index, scan, **merge)
+            staging._stage_finish(report)
+            staging._compact_after(report["changed"])
+            verdict = staging._quick_check()
+            if verdict != "ok":
+                failed = verdict
+            else:
+                self._swap_in(staging)
+        finally:
+            staging.close()
+            if failed is None:
+                self._remove_graph_files(staging.name)
+        if failed is not None:
+            kept = []
+            for path in (staging.content_path, staging.graph_path):
+                target = path.with_name(
+                    path.name.replace(STAGING_INFIX, FAILED_INFIX, 1)
+                )
+                os.rename(path, target)
+                kept.append(str(target))
+            raise GraphStateError(
+                f"staged import failed SQLite quick_check ({failed}); graph "
+                f"{self.name!r} is unchanged. The stage is kept for diagnosis: "
+                + ", ".join(kept)
+            )
+        return report
+
+    def _import_usage(self, package, replace: bool, batch: int) -> int:
+        """Merge the package's usage counters into this graph in bounded batches."""
+        incoming = _usage_entry(package.manifest)
+        rows = package.batches(USAGE_MEMBER, batch) if package.has_usage else ()
+        merged = 0
+        first = True
+        for chunk in rows:
+            for row in chunk:
+                _check_usage_row(row)
+            merged += self._merge_usage(chunk, incoming, replace=replace and first)
+            first = False
+        if first:
+            merged += self._merge_usage([], incoming, replace=replace)
+        return merged
 
     # -------------------------------------------------------------------- read
     def q(self, sparql: str):

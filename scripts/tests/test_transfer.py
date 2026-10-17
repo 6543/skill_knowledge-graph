@@ -5,6 +5,7 @@ from __future__ import annotations
 import zipfile
 
 import pytest
+
 from store import KG, PACKAGE_SUFFIX, GraphValidationError
 
 

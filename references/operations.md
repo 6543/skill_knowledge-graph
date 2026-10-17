@@ -12,6 +12,7 @@ The code acquires Oxigraph's exclusive lock before opening SQLite. Use one `KG` 
 
 ```python
 from store import KG
+
 with KG("project", create=True) as graph:
     graph.load(nodes, edges)  # additive, conflicts abort
     answer = graph.search_question("Where is the timeout configured?")
@@ -144,7 +145,24 @@ The importer rejects duplicate/unknown member names, blob names that are not 64 
 
 Version 4 adds `usage.jsonl` together with a manifest entry `"usage": {"rows": N, "since": DAY, "generation": G}`; the member is listed in `members` with its byte count and hash. Rows are validated as one object per line with exactly those five keys, nonempty strings and nonnegative integers. Export writes counters of existing nodes by default (`export --no-usage` leaves them out). A package without usage rows is still written as version 3, so older readers keep accepting it. Import merges counters by maximum per node after aligning halving generations, so re-importing a package never double counts; two sessions that branched from one package can each lose part of the other's increments. Rows for nodes not in the graph are skipped. `import --replace` replaces the counters too; `import --no-usage` ignores them; a dry run leaves them alone.
 
-Default total uncompressed limit: 512 MiB. Manifest limit: 1 MiB. Export/import/inspect expose `--max-bytes` for a reviewed larger package. JSON objects take more memory than encoded bytes; use substantially smaller packages on constrained systems. Version 1 packages from the draft are accepted after structural/count validation, but have no checksum assurance. Exports use version 4 when they carry usage rows and version 3 otherwise; version 2 packages, which carry records only, stay readable. Existing type loss in a version 1 export is irreversible without the original neutral records.
+Default total uncompressed limit: 2 GiB. Manifest limit: 1 MiB. Export, import and inspect expose `--max-bytes` for a reviewed larger package. Over the limit they fail with `package exceeds max_bytes`, the package size, and the doubled limit (`PackageTooLargeError.next_limit` in Python). Raise it only after the user agrees, one doubling per approval: 2 GiB, then 4 GiB, then 8 GiB. Export and inspect stream in bounded memory. `diff` and imports below the streaming threshold hold JSON objects, which take more memory than encoded bytes. Version 1 packages from the draft are accepted after structural/count validation, but have no checksum assurance. Exports use version 4 when they carry usage rows and version 3 otherwise; version 2 packages, which carry records only, stay readable. Existing type loss in a version 1 export is irreversible without the original neutral records.
+
+### Streamed import
+
+A package with more than 50,000 records (`IMPORT_BATCH_RECORDS`; `import_package(batch_records=N)` in Python), or more than 64 MiB in `nodes.jsonl` plus `edges.jsonl` (`IMPORT_BATCH_BYTES`), is never read whole:
+
+1. Header: the same member, size, manifest and blob checks as the in-memory reader.
+2. Checksums: every record member is hashed while it streams, before any record is parsed.
+3. Validation: each record is parsed and checked on its own; node keys, edge identities and a digest of their props go to a scratch SQLite index under `KG_HOME`, which catches conflicting duplicates and unresolved endpoints across batches. Counts, sources, labels, rels and usage rows are then compared with the manifest.
+4. Probe: records merge into the graph itself, batch by batch, inside one transaction that is always rolled back. A dry run reports from the whole probe. Otherwise the probe stops at the first batch that would change something, unless it found conflicts, which it then collects completely and rejects. If nothing would change, the import ends here: no copy, no swap. `--replace` skips the probe unless it is a dry run.
+5. Staging: verified blobs are kept, then the graph is copied (SQLite backup, RDF checkpoint) to `NAME.import-<hex>`. Records merge into the copy in batches that end at 50,000 records or 64 MiB of raw lines, with the same merge and conflict rules as `load`. Full-text triggers stay off for a large load and the indexes are rebuilt once; the RDF index follows batch by batch while the change is small next to the graph, otherwise it is rebuilt once at the end.
+6. Check: the staged SQLite must pass `PRAGMA quick_check`. A stage that fails is renamed to `NAME.failed-<hex>.*`, reported with its paths, and never swapped in; the graph stays unchanged.
+7. Swap: SQLite moves first, marked so that the next open rebuilds the RDF index; then the RDF directory moves and the mark is cleared. A crash between the two moves therefore costs one rebuild, never a stale index.
+8. Usage counters merge into the graph afterwards, in batches, as in the in-memory path.
+
+Any other failure before the swap deletes the stage and leaves the graph unchanged. Leftovers of a killed import (`NAME.import-<hex>.*`, `NAME.oxi.old-<hex>`, `.NAME.scan-*`) are deleted by the next streamed import into that graph; `.failed-` stages are not. Peak memory is one batch plus the RDF rebuild, not the package. Lines are split on newline bytes only, so text with U+2028 or other Unicode line separators survives. A streamed dry run reports the first 1,000 conflicts and `conflicts_total`. Packages at or under both thresholds keep the in-memory, single-transaction path.
+
+Export writes records straight from SQLite into the archive, hashing and counting as it goes, and adds the manifest last. A package over `--max-bytes` is detected once the records are written; the partial file is deleted. `inspect` runs the header, checksum and validation steps above and holds no records.
 
 ### Raw artifact bytes
 

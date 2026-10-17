@@ -61,6 +61,12 @@ def comma_list(value: str | None):
     return tuple(part for part in (value or "").split(",") if part)
 
 
+MAX_BYTES_HELP = (
+    "uncompressed package limit (default 2 GiB); raise it only after the user "
+    "agrees, to the doubled value the error names"
+)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="kg.py")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -96,7 +102,9 @@ def build_parser():
 
     export = command("export", help="write a portable .graph-skill-db archive")
     export.add_argument("--out", type=Path, required=True)
-    export.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
+    export.add_argument(
+        "--max-bytes", type=int, default=MAX_PACKAGE_BYTES, help=MAX_BYTES_HELP
+    )
     export.add_argument(
         "--raw-root",
         type=Path,
@@ -140,7 +148,9 @@ def build_parser():
     importer.add_argument(
         "--on-conflict", choices=("error", "incoming"), default="error"
     )
-    importer.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
+    importer.add_argument(
+        "--max-bytes", type=int, default=MAX_PACKAGE_BYTES, help=MAX_BYTES_HELP
+    )
     importer.add_argument(
         "--replace", action="store_true", help="discard the current graph first"
     )
@@ -199,7 +209,9 @@ def build_parser():
 
     inspect = commands.add_parser("inspect", help="read an archive without loading it")
     inspect.add_argument("--file", type=Path, required=True)
-    inspect.add_argument("--max-bytes", type=int, default=MAX_PACKAGE_BYTES)
+    inspect.add_argument(
+        "--max-bytes", type=int, default=MAX_PACKAGE_BYTES, help=MAX_BYTES_HELP
+    )
 
     dump = command("dump", help="write the graph back out as neutral records")
     dump.add_argument("--nodes", type=Path, required=True)
@@ -368,12 +380,12 @@ def standalone(args):
             )
         )
     if args.command == "inspect":
-        manifest, nodes, edges = KG.read_package(args.file, max_bytes=args.max_bytes)
+        manifest, counts = KG.check_package(args.file, max_bytes=args.max_bytes)
         return output(
             {
                 **manifest,
-                "read_nodes": len(nodes),
-                "read_edges": len(edges),
+                "read_nodes": counts["nodes"],
+                "read_edges": counts["edges"],
                 "read_blobs": len(manifest.get("blobs") or {}),
             }
         )

@@ -85,7 +85,8 @@ def verify(path: Path, sha256: str) -> None:
 
 
 def check_python() -> None:
-    if sys.version_info < (3, 10):
+    # Runs on any Python 3, so an older one gets this message, not a crash.
+    if sys.version_info < (3, 10):  # noqa: UP036
         raise BootstrapError(
             f"Python 3.10+ is required, this is {platform.python_version()}"
         )
@@ -107,7 +108,7 @@ def ensure_venv(venv: Path, python: str) -> Path:
     if target.exists():
         return target
     made = subprocess.run(
-        [python, "-m", "venv", str(venv)], capture_output=True, text=True
+        [python, "-m", "venv", str(venv)], capture_output=True, text=True, check=False
     )
     if made.returncode != 0:
         # Debian-style Pythons without ensurepip can still make a pip-less venv;
@@ -116,6 +117,7 @@ def ensure_venv(venv: Path, python: str) -> Path:
             [python, "-m", "venv", "--without-pip", str(venv)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if made.returncode != 0:
             raise BootstrapError(f"cannot create {venv}: {made.stderr.strip()}")
@@ -127,12 +129,15 @@ def installed_version(python: Path) -> str | None:
         [str(python), "-c", "import pyoxigraph; print(pyoxigraph.__version__)"],
         capture_output=True,
         text=True,
+        check=False,
     )
     return probe.stdout.strip() if probe.returncode == 0 else None
 
 
 def has_pip(python: Path) -> bool:
-    probe = subprocess.run([str(python), "-m", "pip", "--version"], capture_output=True)
+    probe = subprocess.run(
+        [str(python), "-m", "pip", "--version"], capture_output=True, check=False
+    )
     return probe.returncode == 0
 
 
@@ -203,6 +208,7 @@ def install(
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             method = "network"

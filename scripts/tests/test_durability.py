@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from store import KG, GraphStateError
 
 SCRIPTS = Path(__file__).resolve().parents[1]

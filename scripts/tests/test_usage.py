@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import zipfile
 
-import kg as cli
 import pytest
+
+import kg as cli
 import store
 from store import KG, GraphValidationError, usage_key
 
