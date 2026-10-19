@@ -105,7 +105,7 @@ Expected failures under forcing are only the tests that assert the in-memory pat
    1. `_scanned`: checksums, then record validation against the key index under `KG_HOME/.NAME.scan-*`.
    2. Probe: `_merge_package(probe=True)` merges into the live graph inside one transaction that is always rolled back. A dry run reports from the complete probe. Otherwise the probe stops at the first batch that would change something, unless it found conflicts, which it then collects completely and rejects. No change at all ends the import here, without a copy. `--replace` skips the probe unless it is a dry run, because a replacement always changes the graph and the probe's `DELETE` would journal the whole database.
    3. Stage: `_stage_copy` copies SQLite with the backup API and checkpoints RDF (`Store.backup`, hard links) to `NAME.import-<12 hex>`. `_merge_package` merges batches (records or bytes, whichever ends first) committing each batch; `_stage_finish` raises on conflicts, rebuilds FTS, bumps the revision, stamps or rebuilds RDF.
-   4. Check: `PRAGMA quick_check` on the stage. A failing stage is renamed to `NAME.failed-<hex>.*` and reported; never swapped in. Cleanup never touches `.failed-` names, because a store that broke (for example during VACUUM in a synchronized folder) is evidence.
+   4. Check: `PRAGMA quick_check` on the stage. A stage that fails it, or on which any step (merge, index, `_compact_after`'s VACUUM) raises a corruption error (`_is_corruption`: `SQLITE_CORRUPT`/`SQLITE_NOTADB`), is renamed with its journal to `NAME.failed-<hex>.*` and reported; never swapped in. Other errors (disk full, conflicts) still remove the stage. Cleanup never touches `.failed-` names, because a store that broke (for example during VACUUM in a synchronized folder) is evidence.
    5. Swap (`_swap_in`): stage marked `rdf_revision = SWAP_PENDING`; SQLite file replaced first; RDF directory swapped with two renames (`_swap_rdf`, which restores the old directory if the second rename fails); marker cleared only if the staged index was current; the `KG` object reopens itself.
    6. Usage counters merge into the live graph afterwards, in batches (`_import_usage`), as in the in-memory path.
 3. `_clear_stale_staging` deletes leftovers of a killed import of the same graph before a streamed import starts. Safe only because the graph's RDF lock is held.
@@ -130,6 +130,7 @@ Expected failures under forcing are only the tests that assert the in-memory pat
 - **Record-count-only batches**: 50k records of a few KB each already took about 900 MiB; a few huge chunks could take gigabytes. Batches end at records or bytes.
 - **No-op re-import copied the whole graph** (1.8 GB, 130 s). The probe avoids it.
 - **No integrity check before swap**: a stage corrupted by VACUUM would have replaced a healthy graph.
+- **Corruption raised, not reported**: `VACUUM` in `_compact_after` raised `database disk image is malformed` before `quick_check` ran; the stage was deleted and the raw `sqlite3` error escaped. Corruption errors from any stage step now count as a failed check.
 - `with self.content:` commits on exit. In probe mode `_merge_package` uses `contextlib.nullcontext()` instead and rolls back in `finally`; do not add a `with self.content:` inside the probe.
 - `sqlite3` opens transactions implicitly before DML; `_bulk_index_begin` issues `BEGIN` only when none is open.
 - A RocksDB directory cannot replace a non-empty directory in one rename; see `_swap_rdf`.
@@ -145,7 +146,7 @@ Expected failures under forcing are only the tests that assert the in-memory pat
 - Force the streamed path in a test with `batch_records=` on `import_package`, or by monkeypatching `store.IMPORT_BATCH_RECORDS` / `store.IMPORT_BATCH_BYTES` (both read at call time).
 - Prove "never materializes" by monkeypatching `KG.read_package` to raise, and by spying on `KG._merge_records` batch sizes.
 - Simulate crashes by monkeypatching `store._swap_rdf` (or another step) to raise `KeyboardInterrupt`, then reopen the graph and compare a snapshot.
-- Simulate a corrupt stage by monkeypatching `KG._quick_check`.
+- Simulate a corrupt stage by monkeypatching `KG._quick_check`, or for real with `corrupt_sqlite` in `test_stream_import.py` (needs at least 1,000 changed records so `_compact_after` runs VACUUM).
 - Compare paths by snapshot (records, triple count, SPARQL count, search and find results), not by internal tables.
 - Test behaviour, contracts, regressions and edge cases; do not test declarations or third-party behaviour.
 

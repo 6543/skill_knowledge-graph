@@ -889,6 +889,22 @@ class _Conflicts:
             self.kept.append(conflict)
 
 
+SQLITE_CORRUPT, SQLITE_NOTADB = 11, 26
+
+
+def _is_corruption(exc: sqlite3.DatabaseError) -> bool:
+    """Whether SQLite reports a damaged file rather than a failed operation.
+
+    Python 3.11+ carries the result code; 3.10 does not, but there corruption
+    is the one family raised as bare DatabaseError: busy, full, I/O, schema and
+    constraint errors all arrive as subclasses.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (SQLITE_CORRUPT, SQLITE_NOTADB)
+    return type(exc) is sqlite3.DatabaseError
+
+
 def _fsync_dir(path: Path) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -3912,38 +3928,55 @@ class KG:
     def _stage_and_swap(self, package, index, scan, **merge) -> dict:
         """Merge into a staged copy, check it, swap it in; returns the merge report.
 
-        A stage that fails SQLite's quick_check is never swapped in. Its files
-        are kept under a `.failed-` name, which stale-stage cleanup leaves
-        alone, because a store that broke during VACUUM is evidence.
+        A corrupt stage is never swapped in: one that fails SQLite's
+        quick_check, or one whose merge, indexing or VACUUM SQLite reports as
+        malformed. Its files are kept under a `.failed-` name, which stale-stage
+        cleanup leaves alone, because a store that broke during VACUUM is
+        evidence. Any other error removes the stage as before.
         """
         staging = self._stage_copy()
-        failed = None
+        failed = cause = None
+        step = "merge"
         try:
-            report = staging._merge_package(package, index, scan, **merge)
-            staging._stage_finish(report)
-            staging._compact_after(report["changed"])
-            verdict = staging._quick_check()
-            if verdict != "ok":
-                failed = verdict
+            try:
+                report = staging._merge_package(package, index, scan, **merge)
+                step = "index"
+                staging._stage_finish(report)
+                step = "VACUUM"
+                staging._compact_after(report["changed"])
+                step = "quick_check"
+                verdict = staging._quick_check()
+            except sqlite3.DatabaseError as exc:
+                if not _is_corruption(exc):
+                    raise
+                failed, cause = f"{step}: {exc}", exc
             else:
-                self._swap_in(staging)
+                if verdict != "ok":
+                    failed = f"quick_check: {verdict}"
+                else:
+                    self._swap_in(staging)
         finally:
             staging.close()
             if failed is None:
                 self._remove_graph_files(staging.name)
         if failed is not None:
             kept = []
-            for path in (staging.content_path, staging.graph_path):
+            journal = staging.content_path.with_name(
+                staging.content_path.name + "-journal"
+            )
+            for path in (staging.content_path, journal, staging.graph_path):
+                if path is journal and not path.exists():
+                    continue
                 target = path.with_name(
                     path.name.replace(STAGING_INFIX, FAILED_INFIX, 1)
                 )
                 os.rename(path, target)
                 kept.append(str(target))
             raise GraphStateError(
-                f"staged import failed SQLite quick_check ({failed}); graph "
+                f"staged import is corrupt ({failed}); graph "
                 f"{self.name!r} is unchanged. The stage is kept for diagnosis: "
                 + ", ".join(kept)
-            )
+            ) from cause
         return report
 
     def _import_usage(self, package, replace: bool, batch: int) -> int:

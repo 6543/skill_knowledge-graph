@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sqlite3
 import zipfile
 
 import pytest
@@ -618,6 +619,73 @@ def test_corrupt_stage_is_kept_and_never_swapped_in(home, tmp_path, monkeypatch)
     kept = leftovers(home)
     assert any(name.endswith(".sqlite3") for name in kept)
     assert any(name in str(caught.value) for name in kept)
+
+
+def corrupt_sqlite(path):
+    """Overwrite every page after the header page, as a broken sync or disk would.
+
+    The file change counter is bumped too, so an open connection drops its page
+    cache and reads the damage instead of serving stale good pages.
+    """
+    with open(path, "r+b") as handle:
+        data = bytearray(handle.read())
+        page = int.from_bytes(data[16:18], "big") or 65536
+        counter = int.from_bytes(data[24:28], "big") + 1
+        data[24:28] = counter.to_bytes(4, "big")
+        data[page:] = b"\xa5" * (len(data) - page)
+        handle.seek(0)
+        handle.write(data)
+
+
+def test_stage_corrupted_before_compaction_is_kept_and_never_swapped_in(
+    home, tmp_path, monkeypatch
+):
+    # Regression: VACUUM in `_compact_after` raised "database disk image is
+    # malformed"; the stage was deleted and the raw sqlite3 error escaped.
+    package = package_of("src", corpus(count=1100), tmp_path)
+    finish = KG._stage_finish
+
+    def finish_then_break(self, staged):
+        finish(self, staged)
+        corrupt_sqlite(self.content_path)
+
+    monkeypatch.setattr(KG, "_stage_finish", finish_then_break)
+    with KG("dst", create=True) as graph:
+        graph.load([thing("mine")], [])
+        before = snapshot(graph)
+        with pytest.raises(
+            store.GraphStateError, match="VACUUM: database disk image is malformed"
+        ) as caught:
+            graph.import_package(package, batch_records=500)
+        assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+        assert snapshot(graph) == before
+    kept = leftovers(home)
+    assert not any(".import-" in name for name in kept)
+    assert any(name.endswith(".sqlite3") and ".failed-" in name for name in kept)
+    assert any(name.endswith(".oxi") and ".failed-" in name for name in kept)
+    assert all(name in str(caught.value) for name in kept)
+    # The next import neither trips over the failed stage nor removes it.
+    monkeypatch.setattr(KG, "_stage_finish", finish)
+    with KG("dst") as graph:
+        graph.import_package(package, batch_records=500)
+        assert graph.props("Thing", "t1099")["n"] == 1099
+    assert [name for name in leftovers(home) if ".failed-" in name] == kept
+
+
+def test_non_corruption_stage_error_still_cleans_up(home, tmp_path, monkeypatch):
+    package = package_of("src", corpus(), tmp_path)
+
+    def disk_full(self, changed):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    with KG("dst", create=True) as graph:
+        graph.load([thing("mine")], [])
+        before = snapshot(graph)
+        monkeypatch.setattr(KG, "_compact_after", disk_full)
+        with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+            graph.import_package(package, batch_records=BATCH)
+        assert snapshot(graph) == before
+    assert leftovers(home) == []
 
 
 @pytest.mark.parametrize("batch", [BATCH, None])
